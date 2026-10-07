@@ -1,0 +1,31 @@
+# Pilot batch: same as collect_data.yaml, but 30 runs with seeds 1000-1029,
+# so the pilot never overlaps the final dataset (base_seed 0).
+# Paths are relative to the root of this repo.
+# Gains, scales, default angles, timestep, decimation, policy and model paths
+# are NOT here: they are read from unitree_rl_gym's g1.yaml.
+
+unitree_rl_gym_dir: ../unitree_rl_gym
+g1_config: deploy/deploy_mujoco/configs/g1.yaml   # relative to unitree_rl_gym_dir
+out_dir: data/raw
+
+n_runs: 30
+base_seed: 1000                  # run i uses seed base_seed + i
+episode_policy_steps: 1000    # 50 Hz rows per run (20 s)
+
+# A new command every cmd_period_s, each component uniform in its range.
+cmd_period_s: 5.0
+cmd_ranges:
+  lin_vel_x: [-1.0, 1.0]      # m/s
+  lin_vel_y: [-1.0, 1.0]      # m/s
+  ang_vel_yaw: [-1.0, 1.0]    # rad/s
+
+# One push per push_period_s window, never before push_min_time_s.
+# A push adds a horizontal velocity change (random direction, magnitude
+# uniform in [0, push_max_speed]) to the pelvis free joint.
+push_period_s: 5.0
+push_min_time_s: 1.0
+push_max_speed: 0.5           # m/s
+
+# Foot contact: total floor normal force on a foot's spheres > threshold.
+foot_bodies: [left_ankle_roll_link, right_ankle_roll_link]
+contact_force_threshold: 1.0  # N
