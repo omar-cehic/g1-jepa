@@ -261,6 +261,13 @@ def run_episode(sim, cmds, pushes, n_rows, rows_per_cmd, force_threshold, qpos_t
             obs_tensor = torch.from_numpy(obs).unsqueeze(0)
             # policy inference
             action = policy(obs_tensor).detach().numpy().squeeze()
+            # Not in deploy_mujoco.py: the policy copies its new LSTM memory into
+            # hidden_state and cell_state in place, which in grad mode chains this
+            # call's autograd graph onto all earlier ones (reset_memory does not
+            # cut it), so memory grows ~40 MB per run. detach_ drops that graph
+            # and leaves the stored numbers unchanged.
+            policy.hidden_state.detach_()
+            policy.cell_state.detach_()
             # transform action to target_dof_pos
             target_dof_pos = action * g1["action_scale"] + default_angles
 
@@ -301,6 +308,15 @@ def run_one(cfg, sim, run_index):
     data["seed"] = np.array(seed)
     data["run_index"] = np.array(run_index)
     return data
+
+
+def rss_mb():
+    """Current memory (resident set size) of this process in MB, read from /proc (Linux only)."""
+    with open("/proc/self/status") as f:
+        for line in f:
+            if line.startswith("VmRSS:"):
+                return int(line.split()[1]) / 1024  # the value is in kB
+    return float("nan")
 
 
 def write_meta(path, sim):
@@ -347,7 +363,8 @@ def main():
         data = run_one(cfg, sim, i)
         np.savez_compressed(os.path.join(out_dir, f"run_{i:03d}.npz"), **data)
         status = f"FELL at t={float(data['fall_time']):.3f} s ({data['fall_body']})" if data["fell"] else "ok"
-        print(f"run {i:3d} seed {int(data['seed'])}: {len(data['t'])} rows, {status}")
+        print(f"run {i:3d} seed {int(data['seed'])}: {len(data['t'])} rows, {status}, "
+              f"memory {rss_mb():.0f} MB")
     elapsed = time.time() - start
     print(f"collection took {elapsed:.1f} s ({elapsed / cfg['n_runs']:.2f} s per run); "
           f"estimate for 300 runs: {elapsed / cfg['n_runs'] * 300 / 60:.1f} min")
