@@ -48,4 +48,5 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Summarize a batch: `python scripts/summarize_batch.py data/raw/<folder>`
 - Plot one run: `python scripts/plot_test_batch.py data/raw/<folder> --run 0` (writes results/<timestamp>_test_batch_plots/)
 - Check two batches are identical: `python scripts/compare_batches.py data/raw/<a> data/raw/<b>`
+- Contact exploration plots: `python scripts/explore_contact.py data/raw/<folder>` (writes results/<timestamp>_explore_contact/)
 - Logger tests (plain scripts, no pytest): `for t in tests/test_*.py; do python $t || break; done`
