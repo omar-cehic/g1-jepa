@@ -44,3 +44,8 @@ I am a CS junior and I need to understand every line of this code, because I wil
 
 ## Commands
 (Fill in as the project grows: how to collect data, train, evaluate.)
+- Collect data: `python scripts/collect_data.py configs/collect_data.yaml` (writes data/raw/<timestamp>/)
+- Summarize a batch: `python scripts/summarize_batch.py data/raw/<folder>`
+- Plot one run: `python scripts/plot_test_batch.py data/raw/<folder> --run 0` (writes results/<timestamp>_test_batch_plots/)
+- Check two batches are identical: `python scripts/compare_batches.py data/raw/<a> data/raw/<b>`
+- Logger tests (plain scripts, no pytest): `for t in tests/test_*.py; do python $t || break; done`
