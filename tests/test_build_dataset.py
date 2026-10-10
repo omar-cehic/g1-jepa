@@ -8,6 +8,8 @@
 5. Recomputing the stats from the training runs (written again here, not with the
    script's function) gives the stored values, and stats over all splits differ.
 6. Normalized valid training states have mean ~0 and std ~1 per feature.
+7. For 3 random runs, contact_step equals detect_landings + contact_steps (src/contact.py)
+   on the raw npz exactly, with a 40 ms = 20 sample window.
 
 With no argument, builds the dataset in memory from configs/build_dataset.yaml.
 With a folder, checks that folder's dataset.npz (and reads its copied config).
@@ -25,6 +27,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 import build_dataset  # noqa: E402
+from contact import detect_landings, contact_steps  # noqa: E402
 from features import make_state  # noqa: E402
 
 
@@ -37,7 +40,7 @@ def main():
         folder = sys.argv[1]
         with open(os.path.join(folder, "build_dataset.yaml")) as f:
             cfg = yaml.safe_load(f)
-        data = np.load(os.path.join(folder, "dataset.npz"))
+        data = dict(np.load(os.path.join(folder, "dataset.npz")))  # read each array once; NpzFile re-reads on every [key]
         print(f"checking {folder}")
     else:
         with open(os.path.join(REPO_ROOT, "configs", "build_dataset.yaml")) as f:
@@ -113,6 +116,19 @@ def main():
     assert np.allclose(z.mean(axis=0), 0, atol=1e-8), z.mean(axis=0)
     assert np.allclose(z.std(axis=0), 1, atol=1e-8), z.std(axis=0)
     print("6 ok: normalized valid training states have mean 0 and std 1 per feature")
+
+    # 7
+    assert data["contact_step"].shape == (len(run_ids), 999) and data["contact_step"].dtype == bool
+    rng = np.random.default_rng(7)
+    for r in rng.choice(len(run_ids), size=3, replace=False):
+        d = np.load(raw_path(cfg, run_ids[r]))
+        dt = d["t_fine"][1] - d["t_fine"][0]
+        window = round(cfg["contact_window_s"] / dt)
+        assert window == 20, window  # 40 ms at 500 Hz
+        landings = detect_landings(d["foot_contact"], d["t_fine"])  # one array per foot
+        expected = contact_steps(d["step"], np.concatenate(landings), window)
+        assert np.array_equal(data["contact_step"][r], expected), f"run {run_ids[r]}: contact_step differs"
+    print("7 ok: contact_step equals contact_steps on the raw data exactly for 3 random runs")
     print("all tests passed")
 
 

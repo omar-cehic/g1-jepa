@@ -41,6 +41,9 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Do not change the evaluation protocol (horizons, metrics, 40 ms contact window, probe setup) without asking me first. It is what my proposal promised.
 - Small commits with clear messages. Do not commit data, checkpoints, or large files.
 - Add a quick sanity test for anything math heavy (SIGReg, rollout code, metric code) before using it on real data.
+- Never delete, move, or rename anything in data/ or results/. If cleanup seems needed, ask me first.
+- data/raw/2026-10-07_164422, data/raw/2026-10-07_144241 and data/processed/2026-10-07_182522 are read only on purpose. Do not change their permissions.
+- The official training dataset is data/processed/2026-10-07_182522 (commit 1823ea4).
 
 ## Commands
 (Fill in as the project grows: how to collect data, train, evaluate.)
@@ -48,5 +51,6 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Summarize a batch: `python scripts/summarize_batch.py data/raw/<folder>`
 - Plot one run: `python scripts/plot_test_batch.py data/raw/<folder> --run 0` (writes results/<timestamp>_test_batch_plots/)
 - Check two batches are identical: `python scripts/compare_batches.py data/raw/<a> data/raw/<b>`
+- Build the training dataset: `python scripts/build_dataset.py configs/build_dataset.yaml` (writes data/processed/<timestamp>/)
 - Contact exploration plots: `python scripts/explore_contact.py data/raw/<folder>` (writes results/<timestamp>_explore_contact/)
 - Logger tests (plain scripts, no pytest): `for t in tests/test_*.py; do python $t || break; done`
