@@ -5,10 +5,12 @@
 dataset: data/processed/2026-10-07_182522/dataset.npz
 
 # depth hidden layers (Linear + ReLU) of size width, then a final Linear
-width: 256
+# width chosen by the width sweep (256, 512, 1024, 2048): lowest final tuning loss, seed 0, 100 epochs
+width: 1024
 depth: 3
 
 # AdamW on all parameters
+# lr chosen by the lr check at width 1024 (0.0003, 0.001, 0.003): lowest final tuning loss, seed 0, 100 epochs
 lr: 0.001
 weight_decay: 0.001
 

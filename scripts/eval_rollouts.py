@@ -1,6 +1,8 @@
 """Roll out a model on one split of the dataset and save the per step RMS error curves.
 
 Uses every usable window (H = 100, stride 1) of every run in the split; see src/eval/rollout.py.
+Also saves and prints robust statistics: the median and 90th percentile over windows of the per
+window group error, and the fraction of windows that have left the train range (train_range).
 
 Usage: python scripts/eval_rollouts.py --model constant_velocity [--split tuning]
        python scripts/eval_rollouts.py --model mlp --run_dir results/train/<run folder> [--split tuning]
@@ -22,7 +24,7 @@ import yaml
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from build_dataset import git_commit  # noqa: E402
-from eval.rollout import evaluate, SUBSETS  # noqa: E402
+from eval.rollout import evaluate, train_range, SUBSETS  # noqa: E402
 from features import STATE_NAMES, STATE_GROUPS  # noqa: E402
 from models import constant_velocity  # noqa: E402
 from models.mlp import make_mlp, make_step  # noqa: E402
@@ -63,6 +65,22 @@ def report(metrics):
             print(f"{group if subset == 'all' else '':12s} {subset:8s}{values}")
 
 
+def report_robust(metrics):
+    print()
+    print("per window group error (RMS over the group's features in one window), over windows: median and 90th pct")
+    print(f"{'':12s} {'subset':8s} {'stat':6s}" + "".join(f"{'j = ' + str(j):>12s}" for j in REPORT_STEPS))
+    for group in STATE_GROUPS:
+        for subset in SUBSETS:
+            for stat in ["median", "p90"]:
+                values = "".join(f"{metrics[f'{stat}_{subset}_{group}'][j - 1]:12.4e}" for j in REPORT_STEPS)
+                label = group if subset == "all" and stat == "median" else ""
+                print(f"{label:12s} {subset if stat == 'median' else '':8s} {stat:6s}{values}")
+    print()
+    print("diverged fraction: windows where some predicted feature except gravity_z has left the train range"
+          " (or is not finite) at a step <= j")
+    print(f"{'diverged':12s} {'all':8s} {'frac':6s}" + "".join(f"{metrics['diverged_frac'][j - 1]:12.4f}" for j in REPORT_STEPS))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, choices=sorted(MODELS) + ["mlp"])
@@ -81,9 +99,10 @@ def main():
     else:
         step = MODELS[args.model]
         name = args.model
-    metrics = evaluate(step, data, args.split, H)
+    metrics = evaluate(step, data, args.split, H, bounds=train_range(data))
     print(f"model {args.model}, split {args.split}, H = {H}, RMS error in raw units")
     report(metrics)
+    report_robust(metrics)
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out_dir = os.path.join(REPO_ROOT, "results", "rollouts", f"{stamp}_{name}_{args.split}")

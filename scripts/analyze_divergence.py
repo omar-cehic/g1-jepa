@@ -44,7 +44,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from build_dataset import git_commit  # noqa: E402
 from eval_rollouts import load_mlp_step, DATASET, MODELS, H  # noqa: E402
-from eval.rollout import usable_starts, rollout  # noqa: E402
+from eval.rollout import usable_starts, rollout, train_range, first_exit  # noqa: E402
 from features import STATE_NAMES, STATE_GROUPS  # noqa: E402
 
 REPORT_STEPS = [10, 50, 100]
@@ -52,24 +52,6 @@ J_IDX = [j - 1 for j in REPORT_STEPS]  # prediction j is at index j - 1
 GROUPS_ANY = dict(STATE_GROUPS, any=slice(0, len(STATE_NAMES)))
 KNEE = STATE_NAMES.index("dq_left_knee")
 HEIGHT = STATE_NAMES.index("pelvis_height")
-
-
-def train_range(data):
-    """Min and max (34,) of each feature over s_k and s_{k+1} of the valid train transitions."""
-    train = data["split"] == "train"
-    states, valid = data["states"][train], data["valid"][train]
-    s_k, s_next = states[:, :-1][valid], states[:, 1:][valid]  # (n_valid, 34) each
-    lo = np.minimum(s_k.min(axis=0), s_next.min(axis=0))
-    hi = np.maximum(s_k.max(axis=0), s_next.max(axis=0))
-    return lo, hi
-
-
-def first_exit(outside):
-    """First step j (1 .. H) where outside (W, H) is True, per window; H + 1 if never."""
-    W, n_steps = outside.shape
-    first = np.argmax(outside, axis=1) + 1  # argmax gives the first True (or 0 if none)
-    first[~outside.any(axis=1)] = n_steps + 1
-    return first
 
 
 def top_share(x, fraction):
