@@ -55,3 +55,5 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Contact exploration plots: `python scripts/explore_contact.py data/raw/<folder>` (writes results/<timestamp>_explore_contact/)
 - Logger tests (plain scripts, no pytest): `for t in tests/test_*.py; do python $t || break; done`
 - SIGReg test (synthetic data, about 2.5 min on CPU): `python tests/test_sigreg.py`
+- Train the JEPA: `python src/train_jepa.py configs/train_jepa.yaml [--seed S] [--embed_dim D] [--sigreg_weight W] [--lr LR] [--epochs E]` (writes results/train/<timestamp>_jepa_d<D>_sw<W>_lr<LR>_s<S>/; about 6.5 s per epoch on the RTX 3060)
+- JEPA test (real data, about 1.3 min on CPU): `python tests/test_jepa.py`
