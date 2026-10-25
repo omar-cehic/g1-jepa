@@ -48,12 +48,12 @@ def apply_probe(Z, W, b):
     return np.asarray(Z, dtype=np.float64) @ W + b
 
 
-def fit_mlp_probe(Z, Y, device, seed=0, epochs=20):
+def fit_mlp_probe(Z, Y, device, seed=0, epochs=20, width=MLP_PROBE_WIDTH, depth=MLP_PROBE_DEPTH):
     """Train a fresh small MLP that maps embeddings Z (N, d) to targets Y (N, m). Returns the network.
 
     Z and Y are fixed arrays: when Z comes from a JEPA, the embeddings were computed once by the
     frozen JEPA before this call, so only the probe's own weights are trained here.
-    Network: make_mlp(d, m, 256, 2), 2 hidden layers of 256 with ReLU and a final Linear.
+    Network: make_mlp(d, m, width, depth), by default 2 hidden layers of 256 with ReLU and a final Linear.
     Training is the same recipe as src/train.py: mean squared error, AdamW (lr 0.001, weight decay
     0.001), batches of 512 with the last partial batch kept, lr warmup over 1 epoch then cosine to 0,
     updated every step, gradient norm clipped at 1.0, shuffled with a seeded CPU generator.
@@ -62,7 +62,7 @@ def fit_mlp_probe(Z, Y, device, seed=0, epochs=20):
     Z = torch.from_numpy(np.asarray(Z, dtype=np.float32)).to(device)
     Y = torch.from_numpy(np.asarray(Y, dtype=np.float32)).to(device)
     set_seed(seed)
-    model = make_mlp(Z.shape[1], Y.shape[1], MLP_PROBE_WIDTH, MLP_PROBE_DEPTH).to(device)
+    model = make_mlp(Z.shape[1], Y.shape[1], width, depth).to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=MLP_PROBE_LR, weight_decay=MLP_PROBE_WEIGHT_DECAY)
     n = len(Z)
     steps_per_epoch = math.ceil(n / MLP_PROBE_BATCH_SIZE)

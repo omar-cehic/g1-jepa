@@ -12,6 +12,8 @@
     setup can learn an easy map. Uses the GPU if there is one.
 (e) MLP probe determinism on the CPU: fit_mlp_probe twice with the same seed on 2000 synthetic
     rows for 2 epochs gives identical weights.
+(f) MLP probe default size: on the same synthetic rows, fit_mlp_probe with explicit width=256,
+    depth=2 gives weights identical to the call with the defaults (CPU, seed 0, 2 epochs).
 
 Nothing is written. Run: python tests/test_probe.py
 """
@@ -97,12 +99,27 @@ def test_mlp_deterministic():
     print(f"(e) MLP probe fit twice on cpu with seed 0: identical weights ({len(first)} tensors)")
 
 
+def test_mlp_default_size():
+    rng = np.random.default_rng(2)
+    Z = rng.normal(size=(2000, 64))
+    Y = rng.normal(size=(2000, 34))
+    device = torch.device("cpu")
+    default = fit_mlp_probe(Z, Y, device, seed=0, epochs=2).state_dict()
+    explicit = fit_mlp_probe(Z, Y, device, seed=0, epochs=2, width=256, depth=2).state_dict()
+    assert default.keys() == explicit.keys()
+    for key in default:
+        assert torch.equal(default[key], explicit[key]), key
+    print(f"(f) MLP probe with explicit width=256, depth=2 on cpu: identical weights to the default "
+          f"call ({len(default)} tensors)")
+
+
 def main():
     test_exact_recovery()
     test_collapsed()
     test_deterministic()
     test_mlp_identity()
     test_mlp_deterministic()
+    test_mlp_default_size()
     print("PASS test_probe")
 
 
