@@ -57,3 +57,5 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - SIGReg test (synthetic data, about 2.5 min on CPU): `python tests/test_sigreg.py`
 - Train the JEPA: `python src/train_jepa.py configs/train_jepa.yaml [--seed S] [--embed_dim D] [--sigreg_weight W] [--lr LR] [--epochs E]` (writes results/train/<timestamp>_jepa_d<D>_sw<W>_lr<LR>_s<S>/; about 6.5 s per epoch on the RTX 3060)
 - JEPA test (real data, about 1.3 min on CPU): `python tests/test_jepa.py`
+- Score JEPA runs with the linear probe: `python scripts/score_jepa.py results/train/<run folder> [...]` (writes results/<timestamp>_score_jepa/; about 3.5 s per run on the RTX 3060)
+- Probe test (synthetic data plus one real run, about 10 s with GPU): `python tests/test_probe.py`
