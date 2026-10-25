@@ -7,6 +7,11 @@
     each feature equals the variance of Y (both within 1e-10).
 (c) score_run() on one real run (the 2 epoch smoke run at sigreg_weight 0) gives exactly the same
     row twice: there is no randomness in scoring. Uses the GPU if there is one.
+(d) MLP probe identity check: fit_mlp_probe with Z = the normalized train states (34 numbers) and
+    Y = the same states. On the tuning states the mean squared error is below 0.01: the probe
+    setup can learn an easy map. Uses the GPU if there is one.
+(e) MLP probe determinism on the CPU: fit_mlp_probe twice with the same seed on 2000 synthetic
+    rows for 2 epochs gives identical weights.
 
 Nothing is written. Run: python tests/test_probe.py
 """
@@ -20,10 +25,12 @@ import torch
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
-from eval.probe import fit_linear_probe, apply_probe  # noqa: E402
+from eval.probe import fit_linear_probe, apply_probe, fit_mlp_probe, apply_mlp_probe  # noqa: E402
 from score_jepa import score_run  # noqa: E402
+from train_jepa import pairs  # noqa: E402
 
 RUN_DIR = os.path.join(REPO_ROOT, "results", "train", "2026-10-25_121950_jepa_d128_sw0_lr0.001_s0")
+DATASET = os.path.join(REPO_ROOT, "data", "processed", "2026-10-07_182522", "dataset.npz")
 
 
 def test_exact_recovery():
@@ -65,10 +72,37 @@ def test_deterministic():
           f"no_change_mse {first['no_change_mse']!r}")
 
 
+def test_mlp_identity():
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    data = dict(np.load(DATASET))
+    s_train, _, _ = pairs(data, "train")
+    s_tune, _, _ = pairs(data, "tuning")
+    model = fit_mlp_probe(s_train, s_train, device, seed=0)
+    mse = np.mean((apply_mlp_probe(model, s_tune, device) - s_tune.astype(np.float64)) ** 2)
+    assert mse < 0.01, mse
+    print(f"(d) MLP probe identity on {device}: {len(s_train)} train states, "
+          f"tuning mse {mse:.2e} (must be below 0.01)")
+
+
+def test_mlp_deterministic():
+    rng = np.random.default_rng(2)
+    Z = rng.normal(size=(2000, 64))
+    Y = rng.normal(size=(2000, 34))
+    device = torch.device("cpu")
+    first = fit_mlp_probe(Z, Y, device, seed=0, epochs=2).state_dict()
+    second = fit_mlp_probe(Z, Y, device, seed=0, epochs=2).state_dict()
+    assert first.keys() == second.keys()
+    for key in first:
+        assert torch.equal(first[key], second[key]), key
+    print(f"(e) MLP probe fit twice on cpu with seed 0: identical weights ({len(first)} tensors)")
+
+
 def main():
     test_exact_recovery()
     test_collapsed()
     test_deterministic()
+    test_mlp_identity()
+    test_mlp_deterministic()
     print("PASS test_probe")
 
 
