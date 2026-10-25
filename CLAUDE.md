@@ -37,8 +37,8 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Never overwrite existing data or results. Write to new, dated folders.
 - Every run takes a seed and sets it for numpy, torch, and the simulator. Save the config with the results.
 - Split data by run (episode), never by step: 80% train, 10% tuning, 10% test.
-- Keep the MLP and JEPA comparable: same data, optimizer, training budget, similar parameter counts. Flag anything that breaks this.
-- Do not change the evaluation protocol (horizons, metrics, 40 ms contact window, probe setup) without asking me first. It is what my proposal promised.
+- Keep the MLP and JEPA comparable: same data, optimizer, training budget, and the same width and depth as the MLP (3 hidden layers of 1024, ReLU). Flag anything that breaks this.
+- Do not change the evaluation protocol (horizons, metrics, 40 ms contact window, probe setup) without asking me first. It is what my proposal promised. Agreed change (10/20): contact force replaced foot landing times as a metric.
 - Small commits with clear messages. Do not commit data, checkpoints, or large files.
 - Add a quick sanity test for anything math heavy (SIGReg, rollout code, metric code) before using it on real data.
 - Never delete, move, or rename anything in data/ or results/. If cleanup seems needed, ask me first.
