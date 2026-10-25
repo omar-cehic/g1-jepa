@@ -54,3 +54,4 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Build the training dataset: `python scripts/build_dataset.py configs/build_dataset.yaml` (writes data/processed/<timestamp>/)
 - Contact exploration plots: `python scripts/explore_contact.py data/raw/<folder>` (writes results/<timestamp>_explore_contact/)
 - Logger tests (plain scripts, no pytest): `for t in tests/test_*.py; do python $t || break; done`
+- SIGReg test (synthetic data, about 2.5 min on CPU): `python tests/test_sigreg.py`
