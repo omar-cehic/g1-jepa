@@ -60,3 +60,4 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Score JEPA runs with the linear and MLP probes: `python scripts/score_jepa.py results/train/<run folder> [...]` (writes results/<timestamp>_score_jepa/; about 22 s per run on the RTX 3060)
 - Probe diagnostics for JEPA runs (per feature errors, train vs tuning, bigger probe, probe seeds): `python scripts/probe_diagnostics.py results/train/<run folder> [...]` (writes results/<timestamp>_probe_diag/; about 3.5 to 7.5 min per run on the RTX 3060, mostly the bigger probe)
 - Probe test (synthetic data plus real data, about 70 s with GPU): `python tests/test_probe.py`
+- Readout controls (untrained JEPA encoder probed, and MLP world model one step error, both in normalized state units): `python scripts/readout_controls.py` (writes results/<timestamp>_readout_controls/; about 1.2 min on the RTX 3060)
