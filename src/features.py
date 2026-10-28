@@ -74,3 +74,20 @@ def make_state(qpos, qvel):
         qvel[:, 6:18],   # joint velocities
     ], axis=1)
     return state, list(STATE_NAMES)
+
+
+# Raw MuJoCo state: qpos (19) then qvel (18), nothing converted.
+# The free joint's qvel[0:3] is in the world frame, qvel[3:6] in the pelvis frame.
+FULL_STATE_NAMES = (
+    ["qpos_pelvis_x", "qpos_pelvis_y", "qpos_pelvis_z"]
+    + ["qpos_quat_w", "qpos_quat_x", "qpos_quat_y", "qpos_quat_z"]
+    + ["qpos_" + j for j in JOINT_NAMES]
+    + ["qvel_lin_vel_x_world", "qvel_lin_vel_y_world", "qvel_lin_vel_z_world"]
+    + ["qvel_ang_vel_x_pelvis", "qvel_ang_vel_y_pelvis", "qvel_ang_vel_z_pelvis"]
+    + ["qvel_" + j for j in JOINT_NAMES]
+)
+
+
+def make_full_state(qpos, qvel):
+    """Full state (N x 37): raw qpos (N x 19) and qvel (N x 18) side by side. Returns (state, FULL_STATE_NAMES)."""
+    return np.concatenate([qpos, qvel], axis=1), list(FULL_STATE_NAMES)

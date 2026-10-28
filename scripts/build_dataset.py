@@ -1,7 +1,8 @@
 """Build the training dataset (states, actions, masks, split, normalization) from one raw batch.
 
 Per run (50 Hz rows k = 0 .. 999, transitions k -> k+1 for k = 0 .. 998):
-  states       (1000, 34) make_state(qpos, qvel), float64
+  states       (1000, 34) make_state(qpos, qvel), float64 (state_type "base", the default)
+               (1000, 37) make_full_state(qpos, qvel) = raw qpos and qvel (state_type "full")
   actions      (999, 12)  target_q[k]: the joint targets computed from state k and held
                           during transition k -> k+1 (raw float32 from the logger)
   contact_step (999,)     contact_steps(step, landings of both feet, 40 ms window)
@@ -35,10 +36,17 @@ import yaml
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from contact import detect_landings, contact_steps  # noqa: E402
-from features import make_state, JOINT_NAMES, STATE_NAMES  # noqa: E402
+from features import make_state, make_full_state, JOINT_NAMES, STATE_NAMES, FULL_STATE_NAMES  # noqa: E402
 
 ACTION_NAMES = ["target_q_" + j for j in JOINT_NAMES]
 SPLITS = ["train", "tuning", "test"]
+
+
+def state_type(cfg):
+    """"base" (34-number make_state, used when the config has no state_type) or "full" (raw qpos and qvel)."""
+    kind = cfg.get("state_type", "base")
+    assert kind in ["base", "full"], f"unknown state_type {kind}"
+    return kind
 
 
 def removal_reasons(d, cfg):
@@ -63,7 +71,10 @@ def load_run(path, cfg):
     n_rows = len(d["t"])
     assert n_rows == 1000 and not d["fell"], f"{path}: {n_rows} rows, fell = {d['fell']}"
 
-    states, _ = make_state(d["qpos"], d["qvel"])
+    if state_type(cfg) == "full":
+        states, _ = make_full_state(d["qpos"], d["qvel"])
+    else:
+        states, _ = make_state(d["qpos"], d["qvel"])
     actions = d["target_q"][:-1]  # transition k uses target_q[k]; the last row has no next state
 
     early, push = removal_reasons(d, cfg)
@@ -96,9 +107,9 @@ def split_runs(run_ids, cfg):
 
 def norm_stats(states, actions, valid):
     """Mean and std of s_k, a_k, delta_k over the transitions where valid is True."""
-    s = states[:, :-1][valid]                       # (n_valid, 34)
+    s = states[:, :-1][valid]                       # (n_valid, state dim)
     a = actions[valid]                              # (n_valid, 12)
-    delta = (states[:, 1:] - states[:, :-1])[valid]  # (n_valid, 34)
+    delta = (states[:, 1:] - states[:, :-1])[valid]  # (n_valid, state dim)
     stats = {}
     for name, x in [("state", s), ("action", a), ("delta", delta)]:
         x = x.astype(np.float64)
@@ -183,7 +194,7 @@ def git_commit():
     return git("rev-parse", "HEAD"), git("status", "--porcelain") != ""
 
 
-def report(data):
+def report(data, state_names):
     print()
     print(f"{'split':8s} {'runs':>5s} {'valid transitions':>18s} {'contact-step fraction':>22s}")
     for name in SPLITS:
@@ -192,7 +203,7 @@ def report(data):
         frac = data["contact_step"][m][v].mean()
         print(f"{name:8s} {m.sum():5d} {v.sum():18d} {frac:22.4f}")
 
-    for kind, names in [("state", STATE_NAMES), ("action", ACTION_NAMES), ("delta", STATE_NAMES)]:
+    for kind, names in [("state", state_names), ("action", ACTION_NAMES), ("delta", state_names)]:
         print()
         print(f"{kind} (train, valid transitions)   {'mean':>12s} {'std':>12s}")
         for i, name in enumerate(names):
@@ -207,6 +218,7 @@ def main():
         cfg = yaml.safe_load(f)
 
     data = build(cfg)
+    state_names = FULL_STATE_NAMES if state_type(cfg) == "full" else STATE_NAMES
 
     out_dir = os.path.join(REPO_ROOT, cfg["out_dir"], datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S"))
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite
@@ -232,13 +244,14 @@ def main():
         "valid_transitions_per_split": {name: int(data["valid"][data["split"] == name].sum())
                                         for name in SPLITS},
         "removed_transitions_per_split": removed,
-        "state_names": STATE_NAMES,
+        "state_type": state_type(cfg),
+        "state_names": state_names,
         "action_names": ACTION_NAMES,
     }
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 
-    report(data)
+    report(data, state_names)
     print(f"\nwrote {out_dir}")
 
 
