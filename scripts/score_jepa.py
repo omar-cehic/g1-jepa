@@ -6,7 +6,8 @@ For each run folder (written by src/train_jepa.py):
   3. Fit a linear probe and an MLP probe encode(s_k) -> s_k on the train pairs (src/eval/probe.py).
      The embeddings are computed once by the frozen JEPA; the JEPA is never updated.
      The tuning split is never used for fitting.
-  4. On the tuning pairs, each a mean over pairs and the 34 features, in normalized state units:
+  4. On the tuning pairs, each a mean over pairs and the state features (34 base, 37 full),
+     in normalized state units:
        score           = (probe(predict(encode(s_k), a_k)) - s_{k+1})^2
        present_mse     = (probe(encode(s_k)) - s_k)^2
        mlp_score       = (mlp_probe(predict(encode(s_k), a_k)) - s_{k+1})^2
@@ -46,9 +47,13 @@ COLUMNS = ["folder", "embed_dim", "sigreg_weight", "lr", "seed", "epochs", "scor
 
 
 def load_jepa(run_dir, device):
-    """The JEPA saved by src/train_jepa.py in run_dir, in eval mode on device."""
+    """The JEPA saved by src/train_jepa.py in run_dir, in eval mode on device.
+
+    Checkpoints saved before state_dim was stored are base state runs (34).
+    """
     saved = torch.load(os.path.join(run_dir, "model.pt"), map_location=device)
-    model = JEPA(saved["embed_dim"], saved["width"], saved["depth"]).to(device)
+    model = JEPA(saved["embed_dim"], saved["width"], saved["depth"],
+                 state_dim=saved.get("state_dim", 34)).to(device)
     model.load_state_dict(saved["state_dict"])
     model.eval()
     return model

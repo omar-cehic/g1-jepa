@@ -1,7 +1,8 @@
 """MLP world model: predicts the one step change of the state from (state, action).
 
-  input   [normalized s_k (34), normalized a_k (12)]   (46)
-  output  normalized delta_k (34),  delta_k = s_{k+1} - s_k
+  input   [normalized s_k (state_dim), normalized a_k (12)]   (state_dim + 12)
+  output  normalized delta_k (state_dim),  delta_k = s_{k+1} - s_k
+state_dim is the number of state features in the dataset: 34 (base state) or 37 (full state).
 
 Normalization uses the train stats stored in dataset.npz (state_, action_, delta_ mean and std).
 It is done in float64 in numpy; only the network runs in float32.
@@ -34,14 +35,14 @@ def denormalize(x, stats, name):
 
 
 def model_input(states, actions, stats):
-    """Network input (N, 46) float64 from raw states (N, 34) and actions (N, 12)."""
+    """Network input (N, state_dim + 12) float64 from raw states (N, state_dim) and actions (N, 12)."""
     return np.concatenate([normalize(states, stats, "state"), normalize(actions, stats, "action")], axis=1)
 
 
 def make_step(model, stats, device):
     """step(states, actions) -> next states, for src/eval/rollout.py.
 
-    states (N, 34) raw float64, actions (N, 12) raw. Returns states + predicted delta in float64.
+    states (N, state_dim) raw float64, actions (N, 12) raw. Returns states + predicted delta in float64.
     """
     def step(states, actions):
         x = torch.from_numpy(model_input(states, actions, stats).astype(np.float32)).to(device)

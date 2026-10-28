@@ -13,6 +13,8 @@ The saved model is the one after the last epoch (no best checkpoint).
 Usage: python src/train.py configs/train_mlp.yaml [--seed S] [--width W] [--lr LR] [--epochs E]
 Output: results/train/<YYYY-MM-DD_HHMMSS>_mlp_w<width>_lr<lr>_s<seed>/ with
         config.yaml, model.pt, log.csv, meta.json.
+        On a full state dataset (state_type "full" in its meta.json) the folder is
+        <YYYY-MM-DD_HHMMSS>_mlp_full_w<width>_lr<lr>_s<seed>/.
 """
 
 import argparse
@@ -47,6 +49,15 @@ def check_config(cfg):
     assert cfg["epochs"] > cfg["warmup_epochs"], "need at least one epoch after the warmup"
 
 
+def dataset_state_type(dataset):
+    """"base" or "full", from the meta.json next to dataset (a dataset.npz path relative to the repo).
+
+    Datasets built before state_type existed have no such key: they are "base".
+    """
+    with open(os.path.join(REPO_ROOT, os.path.dirname(dataset), "meta.json"), "r") as f:
+        return json.load(f).get("state_type", "base")
+
+
 def set_seed(seed):
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -54,10 +65,10 @@ def set_seed(seed):
 
 
 def transitions(data, split):
-    """Inputs (n, 46) and targets (n, 34), float32, from the valid transitions of one split."""
+    """Inputs (n, state_dim + 12) and targets (n, state_dim), float32, from the valid transitions of one split."""
     runs = data["split"] == split
     states, valid = data["states"][runs], data["valid"][runs]
-    s = states[:, :-1][valid]                          # s_k        (n, 34) float64
+    s = states[:, :-1][valid]                          # s_k        (n, state_dim) float64
     delta = (states[:, 1:] - states[:, :-1])[valid]    # s_{k+1} - s_k
     a = data["actions"][runs][valid]                   # a_k        (n, 12)
     x = model_input(s, a, data)
@@ -141,7 +152,8 @@ def main():
     check_config(cfg)
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    name = f"{stamp}_mlp_w{cfg['width']}_lr{cfg['lr']:g}_s{cfg['seed']}"
+    full = "_full" if dataset_state_type(cfg["dataset"]) == "full" else ""
+    name = f"{stamp}_mlp{full}_w{cfg['width']}_lr{cfg['lr']:g}_s{cfg['seed']}"
     out_dir = os.path.join(REPO_ROOT, "results", "train", name)
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite
     with open(os.path.join(out_dir, "config.yaml"), "w") as f:
@@ -160,7 +172,8 @@ def main():
 
     n_params = sum(p.numel() for p in model.parameters())
     state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
-    torch.save({"state_dict": state_dict, "width": cfg["width"], "depth": cfg["depth"]},
+    torch.save({"state_dict": state_dict, "width": cfg["width"], "depth": cfg["depth"],
+                "state_dim": y_train.shape[1]},
                os.path.join(out_dir, "model.pt"))
     with open(os.path.join(out_dir, "log.csv"), "w") as f:
         f.write(",".join(LOG_COLUMNS) + "\n")

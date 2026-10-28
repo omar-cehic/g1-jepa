@@ -52,6 +52,8 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Plot one run: `python scripts/plot_test_batch.py data/raw/<folder> --run 0` (writes results/<timestamp>_test_batch_plots/)
 - Check two batches are identical: `python scripts/compare_batches.py data/raw/<a> data/raw/<b>`
 - Build the training dataset: `python scripts/build_dataset.py configs/build_dataset.yaml` (writes data/processed/<timestamp>/)
+- Build the full state dataset (raw qpos and qvel, 37 numbers): `python scripts/build_dataset.py configs/build_dataset_full_state.yaml` (writes data/processed/<timestamp>/; current one is data/processed/2026-10-28_175622)
+- Full state dataset test: `python tests/test_full_state_dataset.py data/processed/<full state folder>`
 - Contact exploration plots: `python scripts/explore_contact.py data/raw/<folder>` (writes results/<timestamp>_explore_contact/)
 - Logger tests (plain scripts, no pytest): `for t in tests/test_*.py; do python $t || break; done`
 - SIGReg test (synthetic data, about 2.5 min on CPU): `python tests/test_sigreg.py`

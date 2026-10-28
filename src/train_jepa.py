@@ -1,8 +1,9 @@
 """Train the JEPA world model on the train runs and report losses on the tuning runs.
 
 Training pairs: every valid transition k -> k+1 of the train runs, as
-  normalized s_k (34), normalized a_k (12), normalized s_{k+1} (34)
-with the train stats in dataset.npz. The test split is never used.
+  normalized s_k (state_dim), normalized a_k (12), normalized s_{k+1} (state_dim)
+with the train stats in dataset.npz (state_dim 34 for the base state, 37 for the full state).
+The test split is never used.
 
 One step on a batch of B pairs:
   z = encode(s_k), z_next = encode(s_{k+1}), z_hat = predict(z, a_k)
@@ -21,6 +22,7 @@ Usage: python src/train_jepa.py configs/train_jepa.yaml [--seed S] [--embed_dim 
                                 [--sigreg_weight W] [--lr LR] [--epochs E]
 Output: results/train/<YYYY-MM-DD_HHMMSS>_jepa_d<embed_dim>_sw<sigreg_weight>_lr<lr>_s<seed>/
         with config.yaml, model.pt, log.csv, meta.json.
+        On a full state dataset (state_type "full" in its meta.json) "jepa" becomes "jepa_full".
 """
 
 import argparse
@@ -41,7 +43,7 @@ from build_dataset import git_commit  # noqa: E402
 from models.mlp import normalize  # noqa: E402
 from models.jepa import JEPA  # noqa: E402
 from models.sigreg import SIGReg  # noqa: E402
-from train import check_config, set_seed, lr_factor  # noqa: E402
+from train import check_config, set_seed, lr_factor, dataset_state_type  # noqa: E402
 
 LOG_COLUMNS = ["epoch", "train_pred_loss", "train_sigreg", "train_loss", "tuning_pred_loss",
                "tuning_sigreg", "tuning_emb_std", "lr_end", "n_clipped", "seconds"]
@@ -55,7 +57,7 @@ def check_jepa_config(cfg):
 
 
 def pairs(data, split):
-    """Normalized s_k (n, 34), a_k (n, 12), s_{k+1} (n, 34), float32, of the valid transitions of one split."""
+    """Normalized s_k (n, state_dim), a_k (n, 12), s_{k+1} (n, state_dim), float32, of the valid transitions of one split."""
     runs = data["split"] == split
     states, valid = data["states"][runs], data["valid"][runs]
     s = normalize(states[:, :-1][valid], data, "state")
@@ -113,7 +115,7 @@ def train(cfg, train_pairs, tuning_pairs, device):
     """
     s_train, a_train, n_train = train_pairs
     set_seed(cfg["seed"])
-    model = JEPA(cfg["embed_dim"], cfg["width"], cfg["depth"]).to(device)
+    model = JEPA(cfg["embed_dim"], cfg["width"], cfg["depth"], state_dim=s_train.shape[1]).to(device)
     sigreg = SIGReg().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     n, batch_size = len(s_train), cfg["batch_size"]
@@ -182,7 +184,8 @@ def main():
     check_jepa_config(cfg)
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    name = (f"{stamp}_jepa_d{cfg['embed_dim']}_sw{cfg['sigreg_weight']:g}"
+    full = "_full" if dataset_state_type(cfg["dataset"]) == "full" else ""
+    name = (f"{stamp}_jepa{full}_d{cfg['embed_dim']}_sw{cfg['sigreg_weight']:g}"
             f"_lr{cfg['lr']:g}_s{cfg['seed']}")
     out_dir = os.path.join(REPO_ROOT, "results", "train", name)
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite
@@ -202,7 +205,7 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
     torch.save({"state_dict": state_dict, "embed_dim": cfg["embed_dim"],
-                "width": cfg["width"], "depth": cfg["depth"]},
+                "width": cfg["width"], "depth": cfg["depth"], "state_dim": train_pairs[0].shape[1]},
                os.path.join(out_dir, "model.pt"))
     with open(os.path.join(out_dir, "log.csv"), "w") as f:
         f.write(",".join(LOG_COLUMNS) + "\n")

@@ -4,8 +4,10 @@ For each run folder (written by src/train_jepa.py), with the frozen JEPA and the
 pairs built exactly as in scripts/score_jepa.py (embeddings computed once, JEPA never updated,
 probes fitted on train only). All errors are squared errors in normalized state units.
   (a) Per feature: fit the linear probe and the default MLP probe (seed 0) encode(s_k) -> s_k on
-      train. On tuning, the present error of each of the 34 features (mean over pairs) for both
-      probes, and the mean over the features of each STATE_GROUPS group.
+      train. On tuning, the present error of each state feature (mean over pairs) for both
+      probes, and the mean over the features of each group. Features and groups follow the
+      dataset's state_type: STATE_NAMES and STATE_GROUPS (base, 34) or FULL_STATE_NAMES and
+      FULL_STATE_GROUPS (full, 37). All runs of one call must use the same state_type.
   (b) Train vs tuning: present error (mean over pairs and features) of the default MLP probe from
       (a) on the train pairs and on the tuning pairs.
   (c) Probe capacity: a bigger MLP probe (width 1024, depth 3, 100 epochs, seed 0, everything else
@@ -34,8 +36,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from build_dataset import git_commit  # noqa: E402
 from eval.probe import fit_linear_probe, apply_probe, fit_mlp_probe, apply_mlp_probe  # noqa: E402
-from features import STATE_NAMES, STATE_GROUPS  # noqa: E402
+from features import STATE_NAMES, STATE_GROUPS, FULL_STATE_NAMES, FULL_STATE_GROUPS  # noqa: E402
 from score_jepa import load_jepa, embed  # noqa: E402
+from train import dataset_state_type  # noqa: E402
 from train_jepa import pairs  # noqa: E402
 
 BIG_WIDTH = 1024
@@ -45,13 +48,19 @@ SEEDS = [0, 1, 2]
 
 
 def per_feature_mse(pred, target):
-    """Mean over pairs of the squared error, one number per feature (34,)."""
+    """Mean over pairs of the squared error, one number per feature (state_dim,)."""
     return np.mean((pred - target) ** 2, axis=0)
 
 
-def group_means(feature_mse):
-    """Mean of the per feature errors within each STATE_GROUPS group, as a dict."""
-    return {group: float(feature_mse[cols].mean()) for group, cols in STATE_GROUPS.items()}
+def group_means(feature_mse, groups):
+    """Mean of the per feature errors within each group of groups (name -> slice), as a dict."""
+    return {group: float(feature_mse[cols].mean()) for group, cols in groups.items()}
+
+
+def run_state_type(run_dir):
+    """state_type ("base" or "full") of the dataset named in run_dir's config.yaml."""
+    with open(os.path.join(run_dir, "config.yaml"), "r") as f:
+        return dataset_state_type(yaml.safe_load(f)["dataset"])
 
 
 def diagnose_run(run_dir, device):
@@ -61,6 +70,10 @@ def diagnose_run(run_dir, device):
     with open(os.path.join(run_dir, "config.yaml"), "r") as f:
         cfg = yaml.safe_load(f)
     data = dict(np.load(os.path.join(REPO_ROOT, cfg["dataset"])))
+    if dataset_state_type(cfg["dataset"]) == "full":
+        names, groups = FULL_STATE_NAMES, FULL_STATE_GROUPS
+    else:
+        names, groups = STATE_NAMES, STATE_GROUPS
     model = load_jepa(run_dir, device)
     s_train, a_train, _ = pairs(data, "train")
     z_train, _ = embed(model, s_train, a_train, device)
@@ -101,17 +114,17 @@ def diagnose_run(run_dir, device):
     times["d"] = time.time() - t
 
     name = os.path.basename(os.path.normpath(run_dir))
-    group_of = {i: group for group, cols in STATE_GROUPS.items() for i in range(34)[cols]}
-    feature_rows = [{"run": name, "feature": STATE_NAMES[i], "group": group_of[i],
+    group_of = {i: group for group, cols in groups.items() for i in range(len(names))[cols]}
+    feature_rows = [{"run": name, "feature": names[i], "group": group_of[i],
                      "linear_mse": float(linear_feat[i]), "mlp_mse": float(mlp_feat[i]),
-                     "big_mlp_mse": float(big_tuning_feat[i])} for i in range(len(STATE_NAMES))]
+                     "big_mlp_mse": float(big_tuning_feat[i])} for i in range(len(names))]
 
     summary = {"run": name, "mlp_train_present_mse": mlp_train, "mlp_tuning_present_mse": mlp_tuning,
                "big_mlp_train_present_mse": float(big_train_feat.mean()),
                "big_mlp_tuning_present_mse": float(big_tuning_feat.mean())}
-    for group, value in group_means(big_train_feat).items():
+    for group, value in group_means(big_train_feat, groups).items():
         summary[f"big_mlp_train_{group}"] = value
-    for group, value in group_means(big_tuning_feat).items():
+    for group, value in group_means(big_tuning_feat, groups).items():
         summary[f"big_mlp_tuning_{group}"] = value
     for label, values in [("mlp_score", seed_scores), ("mlp_present_mse", seed_presents)]:
         for seed, value in zip(SEEDS, values):
@@ -120,10 +133,10 @@ def diagnose_run(run_dir, device):
         summary[f"{label}_max_minus_min"] = max(values) - min(values)
 
     # per group table and the (b), (c), (d) numbers
-    linear_g, mlp_g = group_means(linear_feat), group_means(mlp_feat)
-    big_train_g, big_tuning_g = group_means(big_train_feat), group_means(big_tuning_feat)
+    linear_g, mlp_g = group_means(linear_feat, groups), group_means(mlp_feat, groups)
+    big_train_g, big_tuning_g = group_means(big_train_feat, groups), group_means(big_tuning_feat, groups)
     print(f"  {'group':10s} {'linear':>10s} {'mlp':>10s} {'big_train':>10s} {'big_tuning':>10s}   (present error)")
-    for group in STATE_GROUPS:
+    for group in groups:
         print(f"  {group:10s} {linear_g[group]:10.6f} {mlp_g[group]:10.6f} "
               f"{big_train_g[group]:10.6f} {big_tuning_g[group]:10.6f}")
     print(f"  {'all':10s} {linear_feat.mean():10.6f} {mlp_feat.mean():10.6f} "
@@ -150,6 +163,9 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("run_dirs", nargs="+", help="results/train/<run folder> of JEPA runs")
     args = parser.parse_args()
+    # summary.csv has one column per group, so all runs must have the same groups
+    state_types = {run_state_type(os.path.join(REPO_ROOT, run_dir)) for run_dir in args.run_dirs}
+    assert len(state_types) == 1, f"runs mix state types {sorted(state_types)}: score them in separate calls"
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out_dir = os.path.join(REPO_ROOT, "results", f"{stamp}_probe_diag")

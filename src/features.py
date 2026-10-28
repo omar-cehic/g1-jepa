@@ -87,6 +87,17 @@ FULL_STATE_NAMES = (
     + ["qvel_" + j for j in JOINT_NAMES]
 )
 
+# Which full state dimensions belong to which group.
+FULL_STATE_GROUPS = {
+    "pos_xy": slice(0, 2),
+    "height": slice(2, 3),
+    "quat": slice(3, 7),
+    "joint_pos": slice(7, 19),
+    "lin_vel_world": slice(19, 22),
+    "ang_vel": slice(22, 25),
+    "joint_vel": slice(25, 37),
+}
+
 
 def make_full_state(qpos, qvel):
     """Full state (N x 37): raw qpos (N x 19) and qvel (N x 18) side by side. Returns (state, FULL_STATE_NAMES)."""
