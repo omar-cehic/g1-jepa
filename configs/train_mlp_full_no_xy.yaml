@@ -2,7 +2,7 @@
 # Paths are relative to the root of this repo.
 # Write floats with a decimal point (0.001, not 1e-3): PyYAML reads 1e-3 as a string.
 
-dataset: data/processed/2026-10-28_191504/dataset.npz
+dataset: data/processed/2026-10-29_162623/dataset.npz
 
 # depth hidden layers (Linear + ReLU) of size width, then a final Linear
 # width chosen by the width sweep (256, 512, 1024, 2048): lowest final tuning loss, seed 0, 100 epochs

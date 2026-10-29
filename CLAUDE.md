@@ -53,7 +53,7 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Check two batches are identical: `python scripts/compare_batches.py data/raw/<a> data/raw/<b>`
 - Build the training dataset: `python scripts/build_dataset.py configs/build_dataset.yaml` (writes data/processed/<timestamp>/)
 - Build the full state dataset (raw qpos and qvel, 37 numbers): `python scripts/build_dataset.py configs/build_dataset_full_state.yaml` (writes data/processed/<timestamp>/; current one is data/processed/2026-10-28_175622)
-- Build the full state dataset without pelvis x and y (qpos[2:] and qvel, 35 numbers): `python scripts/build_dataset.py configs/build_dataset_full_no_xy.yaml` (writes data/processed/<timestamp>/; current one is data/processed/2026-10-28_191504)
+- Build the full state dataset without pelvis x and y (qpos[2:] and qvel, 35 numbers): `python scripts/build_dataset.py configs/build_dataset_full_no_xy.yaml` (writes data/processed/<timestamp>/; current one is data/processed/2026-10-29_162623)
 - Full state dataset test (full or full_no_xy): `python tests/test_full_state_dataset.py data/processed/<full state folder>`
 - Train on the full_no_xy dataset: `python src/train_jepa.py configs/train_jepa_full_no_xy.yaml` and `python src/train.py configs/train_mlp_full_no_xy.yaml` (run folders get "_fullnoxy")
 - Contact exploration plots: `python scripts/explore_contact.py data/raw/<folder>` (writes results/<timestamp>_explore_contact/)

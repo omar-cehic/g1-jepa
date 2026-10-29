@@ -3,7 +3,7 @@
 # Write floats with a decimal point (0.001, not 1e-3): PyYAML reads 1e-3 as a string.
 # Everything except embed_dim and sigreg_weight is the same as configs/train_mlp.yaml.
 
-dataset: data/processed/2026-10-28_191504/dataset.npz
+dataset: data/processed/2026-10-29_162623/dataset.npz
 
 # encoder and predictor: depth hidden layers (Linear + ReLU) of size width, then a final Linear
 width: 1024
