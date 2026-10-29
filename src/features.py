@@ -102,3 +102,22 @@ FULL_STATE_GROUPS = {
 def make_full_state(qpos, qvel):
     """Full state (N x 37): raw qpos (N x 19) and qvel (N x 18) side by side. Returns (state, FULL_STATE_NAMES)."""
     return np.concatenate([qpos, qvel], axis=1), list(FULL_STATE_NAMES)
+
+
+# Full state without pelvis x and y: qpos[2:19] (17) then qvel (18), nothing converted.
+FULL_NO_XY_STATE_NAMES = FULL_STATE_NAMES[2:]
+
+# Which full_no_xy state dimensions belong to which group.
+FULL_NO_XY_STATE_GROUPS = {
+    "height": slice(0, 1),
+    "quat": slice(1, 5),
+    "joint_pos": slice(5, 17),
+    "lin_vel_world": slice(17, 20),
+    "ang_vel": slice(20, 23),
+    "joint_vel": slice(23, 35),
+}
+
+
+def make_full_no_xy_state(qpos, qvel):
+    """Full state without pelvis x and y (N x 35): qpos[:, 2:] (N x 17) and qvel (N x 18). Returns (state, FULL_NO_XY_STATE_NAMES)."""
+    return np.concatenate([qpos[:, 2:], qvel], axis=1), list(FULL_NO_XY_STATE_NAMES)

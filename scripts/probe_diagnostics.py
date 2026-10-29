@@ -6,8 +6,9 @@ probes fitted on train only). All errors are squared errors in normalized state 
   (a) Per feature: fit the linear probe and the default MLP probe (seed 0) encode(s_k) -> s_k on
       train. On tuning, the present error of each state feature (mean over pairs) for both
       probes, and the mean over the features of each group. Features and groups follow the
-      dataset's state_type: STATE_NAMES and STATE_GROUPS (base, 34) or FULL_STATE_NAMES and
-      FULL_STATE_GROUPS (full, 37). All runs of one call must use the same state_type.
+      dataset's state_type: STATE_NAMES and STATE_GROUPS (base, 34), FULL_STATE_NAMES and
+      FULL_STATE_GROUPS (full, 37) or FULL_NO_XY_STATE_NAMES and FULL_NO_XY_STATE_GROUPS
+      (full_no_xy, 35). All runs of one call must use the same state_type.
   (b) Train vs tuning: present error (mean over pairs and features) of the default MLP probe from
       (a) on the train pairs and on the tuning pairs.
   (c) Probe capacity: a bigger MLP probe (width 1024, depth 3, 100 epochs, seed 0, everything else
@@ -36,7 +37,8 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from build_dataset import git_commit  # noqa: E402
 from eval.probe import fit_linear_probe, apply_probe, fit_mlp_probe, apply_mlp_probe  # noqa: E402
-from features import STATE_NAMES, STATE_GROUPS, FULL_STATE_NAMES, FULL_STATE_GROUPS  # noqa: E402
+from features import (STATE_NAMES, STATE_GROUPS, FULL_STATE_NAMES, FULL_STATE_GROUPS,  # noqa: E402
+                      FULL_NO_XY_STATE_NAMES, FULL_NO_XY_STATE_GROUPS)
 from score_jepa import load_jepa, embed  # noqa: E402
 from train import dataset_state_type  # noqa: E402
 from train_jepa import pairs  # noqa: E402
@@ -58,7 +60,7 @@ def group_means(feature_mse, groups):
 
 
 def run_state_type(run_dir):
-    """state_type ("base" or "full") of the dataset named in run_dir's config.yaml."""
+    """state_type ("base", "full" or "full_no_xy") of the dataset named in run_dir's config.yaml."""
     with open(os.path.join(run_dir, "config.yaml"), "r") as f:
         return dataset_state_type(yaml.safe_load(f)["dataset"])
 
@@ -72,6 +74,8 @@ def diagnose_run(run_dir, device):
     data = dict(np.load(os.path.join(REPO_ROOT, cfg["dataset"])))
     if dataset_state_type(cfg["dataset"]) == "full":
         names, groups = FULL_STATE_NAMES, FULL_STATE_GROUPS
+    elif dataset_state_type(cfg["dataset"]) == "full_no_xy":
+        names, groups = FULL_NO_XY_STATE_NAMES, FULL_NO_XY_STATE_GROUPS
     else:
         names, groups = STATE_NAMES, STATE_GROUPS
     model = load_jepa(run_dir, device)

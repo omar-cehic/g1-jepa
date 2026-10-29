@@ -1,0 +1,27 @@
+# Settings for scripts/build_dataset.py, full state without pelvis x and y.
+# Same as configs/build_dataset.yaml except state_type.
+# Paths are relative to the root of this repo.
+
+raw_dir: data/raw/2026-10-07_164422
+out_dir: data/processed
+
+# "full_no_xy": the state is raw MuJoCo qpos[2:19] (17) and qvel (18), 35 numbers, nothing converted.
+# Same as "full" (configs/build_dataset_full_state.yaml) without pelvis x and y.
+# Without this key (configs/build_dataset.yaml) the state is the 34-number make_state.
+state_type: full_no_xy
+
+# Split by run: shuffle all run ids with split_seed, then take the first
+# n_train as train, the next n_tuning as tuning, the rest as test.
+split_seed: 0
+n_train: 240
+n_tuning: 30
+n_test: 30
+drop_runs: [299]              # removed after the split (299 fell at t = 16.1 s)
+
+# Transition k -> k+1 is valid only if k >= first_valid_k (row 49 is at t = 1.0 s)
+# and row k+1 is not a push row.
+first_valid_k: 49
+
+# Contact step: a landing (src/contact.py, default 50 ms off / 50 ms on) within
+# this many seconds of the transition's time interval.
+contact_window_s: 0.04

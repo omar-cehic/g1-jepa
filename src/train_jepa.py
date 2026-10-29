@@ -2,7 +2,8 @@
 
 Training pairs: every valid transition k -> k+1 of the train runs, as
   normalized s_k (state_dim), normalized a_k (12), normalized s_{k+1} (state_dim)
-with the train stats in dataset.npz (state_dim 34 for the base state, 37 for the full state).
+with the train stats in dataset.npz (state_dim 34 for the base state, 37 for the full state,
+35 for the full state without pelvis x and y).
 The test split is never used.
 
 One step on a batch of B pairs:
@@ -22,7 +23,8 @@ Usage: python src/train_jepa.py configs/train_jepa.yaml [--seed S] [--embed_dim 
                                 [--sigreg_weight W] [--lr LR] [--epochs E]
 Output: results/train/<YYYY-MM-DD_HHMMSS>_jepa_d<embed_dim>_sw<sigreg_weight>_lr<lr>_s<seed>/
         with config.yaml, model.pt, log.csv, meta.json.
-        On a full state dataset (state_type "full" in its meta.json) "jepa" becomes "jepa_full".
+        On a full state dataset (state_type "full" in its meta.json) "jepa" becomes "jepa_full",
+        and "jepa_fullnoxy" for state_type "full_no_xy".
 """
 
 import argparse
@@ -184,7 +186,7 @@ def main():
     check_jepa_config(cfg)
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    full = "_full" if dataset_state_type(cfg["dataset"]) == "full" else ""
+    full = {"base": "", "full": "_full", "full_no_xy": "_fullnoxy"}[dataset_state_type(cfg["dataset"])]
     name = (f"{stamp}_jepa{full}_d{cfg['embed_dim']}_sw{cfg['sigreg_weight']:g}"
             f"_lr{cfg['lr']:g}_s{cfg['seed']}")
     out_dir = os.path.join(REPO_ROOT, "results", "train", name)

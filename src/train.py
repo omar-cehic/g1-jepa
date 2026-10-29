@@ -14,7 +14,7 @@ Usage: python src/train.py configs/train_mlp.yaml [--seed S] [--width W] [--lr L
 Output: results/train/<YYYY-MM-DD_HHMMSS>_mlp_w<width>_lr<lr>_s<seed>/ with
         config.yaml, model.pt, log.csv, meta.json.
         On a full state dataset (state_type "full" in its meta.json) the folder is
-        <YYYY-MM-DD_HHMMSS>_mlp_full_w<width>_lr<lr>_s<seed>/.
+        <YYYY-MM-DD_HHMMSS>_mlp_full_w<width>_lr<lr>_s<seed>/ ("_fullnoxy" for state_type "full_no_xy").
 """
 
 import argparse
@@ -50,7 +50,7 @@ def check_config(cfg):
 
 
 def dataset_state_type(dataset):
-    """"base" or "full", from the meta.json next to dataset (a dataset.npz path relative to the repo).
+    """"base", "full" or "full_no_xy", from the meta.json next to dataset (a dataset.npz path relative to the repo).
 
     Datasets built before state_type existed have no such key: they are "base".
     """
@@ -152,7 +152,7 @@ def main():
     check_config(cfg)
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
-    full = "_full" if dataset_state_type(cfg["dataset"]) == "full" else ""
+    full = {"base": "", "full": "_full", "full_no_xy": "_fullnoxy"}[dataset_state_type(cfg["dataset"])]
     name = f"{stamp}_mlp{full}_w{cfg['width']}_lr{cfg['lr']:g}_s{cfg['seed']}"
     out_dir = os.path.join(REPO_ROOT, "results", "train", name)
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite

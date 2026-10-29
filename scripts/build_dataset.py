@@ -3,6 +3,7 @@
 Per run (50 Hz rows k = 0 .. 999, transitions k -> k+1 for k = 0 .. 998):
   states       (1000, 34) make_state(qpos, qvel), float64 (state_type "base", the default)
                (1000, 37) make_full_state(qpos, qvel) = raw qpos and qvel (state_type "full")
+               (1000, 35) make_full_no_xy_state(qpos, qvel) = raw qpos[2:] and qvel (state_type "full_no_xy")
   actions      (999, 12)  target_q[k]: the joint targets computed from state k and held
                           during transition k -> k+1 (raw float32 from the logger)
   contact_step (999,)     contact_steps(step, landings of both feet, 40 ms window)
@@ -36,16 +37,18 @@ import yaml
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from contact import detect_landings, contact_steps  # noqa: E402
-from features import make_state, make_full_state, JOINT_NAMES, STATE_NAMES, FULL_STATE_NAMES  # noqa: E402
+from features import (make_state, make_full_state, make_full_no_xy_state, JOINT_NAMES, STATE_NAMES,  # noqa: E402
+                      FULL_STATE_NAMES, FULL_NO_XY_STATE_NAMES)
 
 ACTION_NAMES = ["target_q_" + j for j in JOINT_NAMES]
 SPLITS = ["train", "tuning", "test"]
 
 
 def state_type(cfg):
-    """"base" (34-number make_state, used when the config has no state_type) or "full" (raw qpos and qvel)."""
+    """"base" (34-number make_state, used when the config has no state_type), "full" (raw qpos and qvel)
+    or "full_no_xy" (raw qpos without pelvis x and y, and qvel)."""
     kind = cfg.get("state_type", "base")
-    assert kind in ["base", "full"], f"unknown state_type {kind}"
+    assert kind in ["base", "full", "full_no_xy"], f"unknown state_type {kind}"
     return kind
 
 
@@ -73,6 +76,8 @@ def load_run(path, cfg):
 
     if state_type(cfg) == "full":
         states, _ = make_full_state(d["qpos"], d["qvel"])
+    elif state_type(cfg) == "full_no_xy":
+        states, _ = make_full_no_xy_state(d["qpos"], d["qvel"])
     else:
         states, _ = make_state(d["qpos"], d["qvel"])
     actions = d["target_q"][:-1]  # transition k uses target_q[k]; the last row has no next state
@@ -218,7 +223,8 @@ def main():
         cfg = yaml.safe_load(f)
 
     data = build(cfg)
-    state_names = FULL_STATE_NAMES if state_type(cfg) == "full" else STATE_NAMES
+    state_names = {"base": STATE_NAMES, "full": FULL_STATE_NAMES,
+                   "full_no_xy": FULL_NO_XY_STATE_NAMES}[state_type(cfg)]
 
     out_dir = os.path.join(REPO_ROOT, cfg["out_dir"], datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S"))
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite

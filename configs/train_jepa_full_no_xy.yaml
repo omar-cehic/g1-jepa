@@ -1,0 +1,26 @@
+# Settings for src/train_jepa.py (JEPA world model).
+# Paths are relative to the root of this repo.
+# Write floats with a decimal point (0.001, not 1e-3): PyYAML reads 1e-3 as a string.
+# Everything except embed_dim and sigreg_weight is the same as configs/train_mlp.yaml.
+
+dataset: data/processed/2026-10-28_191504/dataset.npz
+
+# encoder and predictor: depth hidden layers (Linear + ReLU) of size width, then a final Linear
+width: 1024
+depth: 3
+# embedding size, chosen from 64, 128, 256 by the selection rule
+embed_dim: 128
+
+# loss = pred_loss + sigreg_weight * SIGReg
+# 0.0225 = LeWM's 0.09 * 128 / 512, because SIGReg is multiplied by the batch size
+sigreg_weight: 0.0225
+
+# AdamW on all parameters
+lr: 0.001
+weight_decay: 0.001
+
+batch_size: 512
+epochs: 100
+warmup_epochs: 1    # lr goes linearly from 0 to lr over this many epochs, then cosine to 0
+grad_clip: 1.0      # max gradient norm (clip_grad_norm_), every step
+seed: 0
