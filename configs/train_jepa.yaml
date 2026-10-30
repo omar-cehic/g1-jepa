@@ -15,6 +15,9 @@ embed_dim: 128
 # 0.0225 = LeWM's 0.09 * 128 / 512, because SIGReg is multiplied by the batch size
 sigreg_weight: 0.0225
 
+# number of past embeddings the predictor sees (z_{k-history+1}, ..., z_k), 1 to 50; 1 = no history
+history: 1
+
 # AdamW on all parameters
 lr: 0.001
 weight_decay: 0.001

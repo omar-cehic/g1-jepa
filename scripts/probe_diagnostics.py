@@ -2,7 +2,8 @@
 
 For each run folder (written by src/train_jepa.py), with the frozen JEPA and the train and tuning
 pairs built exactly as in scripts/score_jepa.py (embeddings computed once, JEPA never updated,
-probes fitted on train only). All errors are squared errors in normalized state units.
+probes fitted on train only; predictions use the run's history, present errors encode s_k alone).
+All errors are squared errors in normalized state units.
   (a) Per feature: fit the linear probe and the default MLP probe (seed 0) encode(s_k) -> s_k on
       train. On tuning, the present error of each state feature (mean over pairs) for both
       probes, and the mean over the features of each group. Features and groups follow the
@@ -39,9 +40,9 @@ from build_dataset import git_commit  # noqa: E402
 from eval.probe import fit_linear_probe, apply_probe, fit_mlp_probe, apply_mlp_probe  # noqa: E402
 from features import (STATE_NAMES, STATE_GROUPS, FULL_STATE_NAMES, FULL_STATE_GROUPS,  # noqa: E402
                       FULL_NO_XY_STATE_NAMES, FULL_NO_XY_STATE_GROUPS)
-from score_jepa import load_jepa, embed  # noqa: E402
+from score_jepa import load_jepa, embed_windows  # noqa: E402
 from train import dataset_state_type  # noqa: E402
-from train_jepa import pairs  # noqa: E402
+from train_jepa import window_pairs  # noqa: E402
 
 BIG_WIDTH = 1024
 BIG_DEPTH = 3
@@ -79,10 +80,12 @@ def diagnose_run(run_dir, device):
     else:
         names, groups = STATE_NAMES, STATE_GROUPS
     model = load_jepa(run_dir, device)
-    s_train, a_train, _ = pairs(data, "train")
-    z_train, _ = embed(model, s_train, a_train, device)
-    s, a, s_next = pairs(data, "tuning")
-    z, z_hat = embed(model, s, a, device)
+    states, rows, a = window_pairs(data, "train", model.history)
+    s_train = states[rows]
+    z_train, _ = embed_windows(model, states, rows, a, device)
+    states, rows, a = window_pairs(data, "tuning", model.history)
+    s, s_next = states[rows], states[rows + 1]
+    z, z_hat = embed_windows(model, states, rows, a, device)
     s_train64, s64, s_next64 = (x.astype(np.float64) for x in (s_train, s, s_next))
     times["load_and_embed"] = time.time() - t
 

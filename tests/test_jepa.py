@@ -29,6 +29,22 @@ Uses data/processed/2026-10-07_182522.
          separate torch.no_grad() forward pass;
     (h3) the encoder gradient of the SIGReg term alone is identical with it on and off;
     (h4) the encoder gradient of the total loss differs between on and off.
+State history:
+(i) window_pairs() gives 226,099 train and 28,381 tuning pairs for history 1, 3, 10 and 40, the same
+    pairs as pairs() (same rows for every history, states[rows] == s_k and states[rows + 1] == s_{k+1}
+    of pairs()). History 51 is refused by window_pairs() and by check_jepa_config(), history 0 by
+    check_jepa_config().
+(j) Windows: at history 10 and 40, for the first, middle and last pair of each of the first 3 train
+    runs and the first pair after every gap in its valid steps, the window from gather_windows()
+    equals the hand normalized rows k-n+1, ..., k of that run, and its last state is s_k of pairs().
+(k) Residual at history 10: predict(z, a, z_past) equals z + predictor([z_past[:, 0], ..., z_past[:, 8], z, a])
+    built by hand (oldest first, z_k last, then a_k), exactly; with the predictor's last Linear zeroed it is z.
+(l) Loss at history 10 on one real batch of 512: the SIGReg value is exactly the one of z_k and z_{k+1}
+    encoded alone, pred_loss matches a hand computation (each window state encoded alone), the gradient of
+    pred_loss reaches the oldest window state, and the gradient of SIGReg alone on the older window
+    states is exactly zero.
+(m) Predictor weight counts at embed_dim 256 for history 1, 3, 10 and 40 (printed; history 1 is the
+    2,637,056 of (a)).
 
 Nothing is written. Run: python tests/test_jepa.py
 """
@@ -39,6 +55,7 @@ import time
 
 import numpy as np
 import torch
+import yaml
 
 REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
@@ -189,13 +206,13 @@ def test_fixed_batch(data):
 
 
 def test_determinism(data):
-    s, a, s_next = train_batch(data, 640)
+    states, rows, a = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", 1))
     cfg = dict(CFG, embed_dim=64, batch_size=64, epochs=2, warmup_epochs=1)   # 2 x 10 = 20 steps
     print("    determinism runs:")
     weights = []
     for seed in [0, 0, 1]:
-        model, _ = train_jepa.train(dict(cfg, seed=seed), (s, a, s_next),
-                                    (s[:128], a[:128], s_next[:128]), CPU)
+        model, _ = train_jepa.train(dict(cfg, seed=seed), (states, rows[:640], a[:640]),
+                                    (states, rows[:128], a[:128]), CPU)
         weights.append(model.state_dict())
     same = all(torch.equal(weights[0][k], weights[1][k]) for k in weights[0])
     different = not any(torch.equal(weights[0][k], weights[2][k]) for k in weights[0])
@@ -256,6 +273,114 @@ def test_stop_grad(data):
           f"on {g_on.norm().item():.4e}, max |diff| {(g_on - g_off).abs().max().item():.4e}")
 
 
+def test_window_pairs(data):
+    with open(os.path.join(REPO_ROOT, "configs", "train_jepa.yaml"), "r") as f:
+        cfg = yaml.safe_load(f)
+    for split, n_expected in [("train", 226099), ("tuning", 28381)]:
+        s, a, s_next = train_jepa.pairs(data, split)
+        rows_1 = None
+        for history in [1, 3, 10, 40]:
+            states, rows, a_w = train_jepa.window_pairs(data, split, history)
+            assert states.dtype == a_w.dtype == np.float32 and rows.dtype == np.int64
+            assert len(rows) == n_expected and a_w.shape == (n_expected, 12), (split, history, len(rows))
+            if rows_1 is None:
+                rows_1 = rows
+            assert np.array_equal(rows, rows_1)
+            assert np.array_equal(states[rows], s) and np.array_equal(states[rows + 1], s_next)
+            assert np.array_equal(a_w, a)
+        print(f"(i) {split}: {n_expected} pairs at history 1, 3, 10 and 40, the same pairs as pairs()")
+    for bad in [lambda: train_jepa.window_pairs(data, "train", 51),
+                lambda: train_jepa.check_jepa_config(dict(cfg, stop_grad=False, history=51)),
+                lambda: train_jepa.check_jepa_config(dict(cfg, stop_grad=False, history=0))]:
+        try:
+            bad()
+        except AssertionError as e:
+            print(f"    refused: {e}")
+        else:
+            raise AssertionError("history 51 or 0 was not refused")
+    train_jepa.check_jepa_config(dict(cfg, stop_grad=False, history=50))
+
+
+def test_windows(data):
+    s_pairs, _, _ = train_jepa.pairs(data, "train")
+    runs = np.flatnonzero(data["split"] == "train")[:3]
+    for history in [10, 40]:
+        states, rows, _ = train_jepa.window_pairs(data, "train", history)
+        windows = train_jepa.gather_windows(torch.from_numpy(states), torch.from_numpy(rows), history).numpy()
+        offset, n_checked, n_with_invalid = 0, 0, 0
+        for run in runs:
+            ks = np.flatnonzero(data["valid"][run])          # pairs are stored run by run, k ascending
+            after_gap = np.flatnonzero(np.diff(ks) > 1) + 1  # first pair after a run of invalid steps
+            for i in sorted({0, len(ks) // 2, len(ks) - 1, *after_gap.tolist()}):
+                k = ks[i]
+                hand = data["states"][run][k - history + 1:k + 1]      # rows k-n+1, ..., k of this run
+                hand = ((hand - data["state_mean"]) / data["state_std"]).astype(np.float32)
+                window = windows[offset + i]
+                assert window.shape == (history, 34)
+                assert np.array_equal(window, hand), (history, run, k)
+                assert np.array_equal(window[-1], s_pairs[offset + i])
+                n_checked += 1
+                n_with_invalid += not data["valid"][run][k - history + 1:k].all()
+            offset += len(ks)
+        print(f"(j) history {history}: {n_checked} windows in the first {len(runs)} train runs equal the hand "
+              f"normalized rows k-{history - 1}..k, last state = s_k "
+              f"({n_with_invalid} of them span invalid steps)")
+
+
+def test_residual_history():
+    torch.manual_seed(0)
+    model = JEPA(64, 1024, 3, history=10)
+    assert model.predictor[0].in_features == 10 * 64 + 12
+    z, a, z_past = torch.randn(100, 64), torch.randn(100, 12), torch.randn(100, 9, 64)
+    by_hand = z + model.predictor(torch.cat([z_past[:, j] for j in range(9)] + [z, a], dim=1))
+    z_hat = model.predict(z, a, z_past)
+    assert torch.equal(z_hat, by_hand)
+    with torch.no_grad():
+        model.predictor[-1].weight.zero_()
+        model.predictor[-1].bias.zero_()
+    assert torch.equal(model.predict(z, a, z_past), z)
+    print("(k) history 10: predict(z, a, z_past) == z + predictor([z_past oldest first, z, a]) exactly; "
+          "with the last layer zeroed predict == z")
+
+
+def test_loss_history(data):
+    states, rows, a = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", 10))
+    r = rows[:512]
+    s = train_jepa.gather_windows(states, r, 10).requires_grad_()
+    s_next, a = states[r + 1], a[:512]
+    torch.manual_seed(0)
+    model = JEPA(64, 1024, 3, history=10)
+    sigreg = SIGReg()
+    torch.manual_seed(1)
+    pred_loss, sig = train_jepa.jepa_losses(model, sigreg, s, a, s_next)
+    with torch.no_grad():
+        z, z_next = model.encode(s[:, -1]), model.encode(s_next)
+        z_past = torch.stack([model.encode(s[:, j]) for j in range(9)], dim=1)
+        hand_pred = (model.predict(z, a, z_past) - z_next).square().mean()
+        torch.manual_seed(1)
+        hand_sig = sigreg(torch.stack([z, z_next]))
+    assert torch.equal(sig, hand_sig), (sig.item(), hand_sig.item())
+    assert torch.allclose(pred_loss, hand_pred, rtol=1e-5, atol=0), (pred_loss.item(), hand_pred.item())
+    g_pred = torch.autograd.grad(pred_loss, s, retain_graph=True)[0]
+    g_sig = torch.autograd.grad(sig, s)[0]
+    assert g_pred[:, 0].norm().item() > 0
+    assert torch.equal(g_sig[:, :-1], torch.zeros_like(g_sig[:, :-1])) and g_sig[:, -1].norm().item() > 0
+    print(f"(l) history 10, 512 real pairs: SIGReg {sig.item():.4f} == SIGReg of z_k, z_k+1 alone; pred_loss "
+          f"{pred_loss.item():.6f} vs hand {hand_pred.item():.6f}; grad of pred_loss on the oldest state "
+          f"{g_pred[:, 0].norm().item():.3e}, grad of SIGReg on the older states exactly 0")
+
+
+def test_history_weight_counts():
+    counts = {}
+    for history in [1, 3, 10, 40]:
+        counts[history] = n_params(JEPA(256, 1024, 3, history=history).predictor)
+        expected = (history * 256 + 12) * 1024 + 1024 + 2 * (1024 * 1024 + 1024) + 1024 * 256 + 256
+        assert counts[history] == expected, (history, counts[history], expected)
+    assert counts[1] == 2637056
+    print("(m) predictor weights at embed_dim 256: "
+          + ", ".join(f"history {h} {c:,}" for h, c in counts.items()))
+
+
 def main():
     data = dict(np.load(DATASET))
     test_shapes()
@@ -266,6 +391,11 @@ def main():
     test_fixed_batch(data)
     test_determinism(data)
     test_stop_grad(data)
+    test_window_pairs(data)
+    test_windows(data)
+    test_residual_history()
+    test_loss_history(data)
+    test_history_weight_counts()
     print("PASS test_jepa")
 
 
