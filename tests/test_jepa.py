@@ -12,8 +12,9 @@ Uses data/processed/2026-10-07_182522.
     Linear weight and bias 0. On 512 real train pairs pred_loss is exactly 0, so the loss at
     sigreg_weight 0 is exactly 0 (the global minimum). SIGReg of this constant embedding is printed
     and must be above 10 (far above the ~1.05 of a Gaussian batch).
-(d) No stop gradient: on one real batch, encoder gradients of the loss as written (jepa_losses)
-    differ from those with z_next detached, and the z_next branch alone gives nonzero gradient.
+(d) No stop gradient: on one real batch, encoder gradients of the loss as written (jepa_losses
+    with stop_grad off) differ from those with z_next detached, and the z_next branch alone gives
+    nonzero gradient.
 (e) pairs(): 226,099 train and 28,381 tuning pairs, float32; on the first 3 train runs,
     s_k and s_{k+1} of each pair equal the hand normalized states at rows k and k+1 of its run.
 (f) On CPU, a fresh JEPA (embed_dim 64) trained with train_step on one fixed batch of 512 train
@@ -21,6 +22,13 @@ Uses data/processed/2026-10-07_182522.
     initial one and the final SIGReg is below half the initial SIGReg.
 (g) Determinism: on CPU, train() twice with the same seed (20 steps on 640 train pairs,
     embed_dim 64) gives identical weights; a different seed gives different weights.
+(h) Stop gradient option, on one real batch of 512 (the global torch RNG is seeded before every
+    loss, so SIGReg draws the same projections each time):
+    (h1) the total loss value is identical with stop_grad on and off;
+    (h2) with it on, the encoder gradient equals the one where the target is a constant from a
+         separate torch.no_grad() forward pass;
+    (h3) the encoder gradient of the SIGReg term alone is identical with it on and off;
+    (h4) the encoder gradient of the total loss differs between on and off.
 
 Nothing is written. Run: python tests/test_jepa.py
 """
@@ -114,7 +122,7 @@ def test_no_stop_gradient(data):
         return torch.cat([p.grad.flatten() for p in model.encoder.parameters()])
 
     torch.manual_seed(1)                                # same SIGReg projections in both
-    pred_loss, sig = train_jepa.jepa_losses(model, sigreg, s, a, s_next)
+    pred_loss, sig = train_jepa.jepa_losses(model, sigreg, s, a, s_next, stop_grad=False)
     g_full = encoder_grads(pred_loss + w * sig)
 
     torch.manual_seed(1)
@@ -195,6 +203,59 @@ def test_determinism(data):
     print("(g) 20 steps on CPU: seed 0 twice gives identical weights; seed 1 gives different weights")
 
 
+def test_stop_grad(data):
+    s, a, s_next = train_batch(data, 512)
+    torch.manual_seed(0)
+    model = JEPA(64, 1024, 3)
+    sigreg = SIGReg()
+    w = CFG["sigreg_weight"]
+
+    def encoder_grads(loss):
+        model.zero_grad()
+        loss.backward()
+        return torch.cat([p.grad.flatten() for p in model.encoder.parameters()])
+
+    torch.manual_seed(1)
+    pred_off, sig_off = train_jepa.jepa_losses(model, sigreg, s, a, s_next, stop_grad=False)
+    loss_off = pred_off + w * sig_off
+    torch.manual_seed(1)
+    pred_on, sig_on = train_jepa.jepa_losses(model, sigreg, s, a, s_next, stop_grad=True)
+    loss_on = pred_on + w * sig_on
+    assert torch.equal(loss_on, loss_off), (loss_on.item(), loss_off.item())
+    print(f"(h1) total loss: stop_grad off {loss_off.item():.6f}, on {loss_on.item():.6f} (identical)")
+
+    g_off = encoder_grads(loss_off)
+    g_on = encoder_grads(loss_on)
+
+    # reference: the target is computed in its own no_grad pass, so it is a constant
+    with torch.no_grad():
+        target = model.encode(s_next)
+    torch.manual_seed(1)
+    z = model.encode(s)
+    z_next = model.encode(s_next)
+    pred_ref = (model.predict(z, a) - target).square().mean()
+    sig_ref = sigreg(torch.stack([z, z_next]))
+    g_ref = encoder_grads(pred_ref + w * sig_ref)
+    assert torch.equal(g_on, g_ref), (g_on - g_ref).abs().max().item()
+    print(f"(h2) encoder grad with stop_grad on == with a no_grad constant target "
+          f"(norm {g_on.norm().item():.4e}, max |diff| {(g_on - g_ref).abs().max().item()})")
+
+    torch.manual_seed(1)
+    _, sig_off = train_jepa.jepa_losses(model, sigreg, s, a, s_next, stop_grad=False)
+    g_sig_off = encoder_grads(sig_off)
+    torch.manual_seed(1)
+    _, sig_on = train_jepa.jepa_losses(model, sigreg, s, a, s_next, stop_grad=True)
+    g_sig_on = encoder_grads(sig_on)
+    assert torch.equal(g_sig_on, g_sig_off)
+    assert g_sig_on.norm().item() > 0
+    print(f"(h3) encoder grad of SIGReg alone identical with stop_grad on and off "
+          f"(norm {g_sig_on.norm().item():.4e})")
+
+    assert not torch.equal(g_on, g_off)
+    print(f"(h4) encoder grad of the total loss differs: off {g_off.norm().item():.4e}, "
+          f"on {g_on.norm().item():.4e}, max |diff| {(g_on - g_off).abs().max().item():.4e}")
+
+
 def main():
     data = dict(np.load(DATASET))
     test_shapes()
@@ -204,6 +265,7 @@ def main():
     test_pairs(data)
     test_fixed_batch(data)
     test_determinism(data)
+    test_stop_grad(data)
     print("PASS test_jepa")
 
 

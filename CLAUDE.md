@@ -3,7 +3,7 @@
 ## What this repo is
 Course project for CSC 383/483 Deep Learning (DePaul). I compare two learned world models of the Unitree G1 humanoid walking in MuJoCo:
 - an MLP that predicts the change in state from (state, action)
-- a JEPA (following LeWorldModel): MLP encoder, MLP predictor that also takes the action, loss = embedding prediction error + lambda * SIGReg, trained end to end with no EMA target encoder and no stop gradient
+- a JEPA (following LeWorldModel): MLP encoder, MLP predictor that also takes the action, loss = embedding prediction error + lambda * SIGReg, trained end to end with no EMA target encoder; stop gradient on the target is an option (--stop_grad), off by default
 
 The question is which model predicts better around foot contact, over 10, 50, and 100 step rollouts. Final report due November 12, 2026.
 
