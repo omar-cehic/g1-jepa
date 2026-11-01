@@ -38,13 +38,17 @@ REPORT_STEPS = [1, 10, 50, 100]
 def load_mlp_step(run_dir, data, device):
     """step(states, actions) of the MLP saved by src/train.py in run_dir, normalized with data's stats.
 
-    Raises ValueError if the run was trained on a different dataset than DATASET.
+    Raises ValueError if the run was trained on a different dataset than DATASET, or is a transformer
+    world model run (model "transformer" in model.pt; checkpoints saved before model existed are MLP runs).
     """
     with open(os.path.join(run_dir, "config.yaml"), "r") as f:
         cfg = yaml.safe_load(f)
     if os.path.normpath(cfg["dataset"]) != os.path.normpath(DATASET):
         raise ValueError(f"{run_dir} was trained on {cfg['dataset']}, but this script evaluates {DATASET}")
     saved = torch.load(os.path.join(run_dir, "model.pt"), map_location=device)
+    if saved.get("model", "mlp") != "mlp":
+        raise ValueError(f"{run_dir} is a {saved['model']} world model run: rollouts (eval_rollouts.py, "
+                         f"analyze_divergence.py) only support MLP runs for now")
     in_dim = len(data["state_mean"]) + len(data["action_mean"])  # 34 + 12
     model = make_mlp(in_dim, len(data["delta_mean"]), saved["width"], saved["depth"]).to(device)
     model.load_state_dict(saved["state_dict"])

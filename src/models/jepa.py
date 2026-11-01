@@ -37,22 +37,28 @@ ACTION_DIM = 12
 
 
 class TransformerPredictor(nn.Module):
-    """Windows of embeddings (N, n, embed_dim) and actions (N, n, 12), oldest first -> change of the
-    last embedding (N, embed_dim). n must be history (one position vector per window slot)."""
+    """Windows of inputs (N, n, in_dim) and actions (N, n, 12), oldest first -> one output vector
+    (N, out_dim) from the last token. n must be history (one position vector per window slot).
 
-    def __init__(self, embed_dim, width, depth, history):
+    In the JEPA the inputs are embeddings: in_dim = d_model = out_dim = embed_dim, and the output is
+    the change of the last embedding. The transformer world model in src/train.py uses it on states:
+    in_dim = out_dim = state_dim, d_model 256, and the output is the normalized change of the state.
+    """
+
+    def __init__(self, in_dim, d_model, out_dim, width, depth, history):
         super().__init__()
-        self.token = nn.Linear(embed_dim + ACTION_DIM, embed_dim)
-        self.position = nn.Parameter(torch.empty(history, embed_dim))
+        self.history = history
+        self.token = nn.Linear(in_dim + ACTION_DIM, d_model)
+        self.position = nn.Parameter(torch.empty(history, d_model))
         nn.init.normal_(self.position, std=0.02)
         # depth layers built one by one, so each starts from its own random weights
         # (nn.TransformerEncoder deep copies one layer, so all layers would start the same)
         self.blocks = nn.Sequential(*[
-            nn.TransformerEncoderLayer(embed_dim, nhead=4, dim_feedforward=width, dropout=0.0,
+            nn.TransformerEncoderLayer(d_model, nhead=4, dim_feedforward=width, dropout=0.0,
                                        activation="relu", batch_first=True, norm_first=True)
             for _ in range(depth)])
-        self.norm = nn.LayerNorm(embed_dim)
-        self.out = nn.Linear(embed_dim, embed_dim)
+        self.norm = nn.LayerNorm(d_model)
+        self.out = nn.Linear(d_model, out_dim)
 
     def forward(self, z, a):
         x = self.token(torch.cat([z, a], dim=2)) + self.position
@@ -70,7 +76,7 @@ class JEPA(nn.Module):
             self.predictor = make_mlp(history * embed_dim + ACTION_DIM, embed_dim, width, depth)
         else:
             assert predictor == "transformer", f"unknown predictor {predictor!r}"
-            self.predictor = TransformerPredictor(embed_dim, width, depth, history)
+            self.predictor = TransformerPredictor(embed_dim, embed_dim, embed_dim, width, depth, history)
 
     def encode(self, s):
         """Normalized states (N, state_dim) -> embeddings (N, embed_dim)."""

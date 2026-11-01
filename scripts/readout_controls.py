@@ -14,12 +14,18 @@ features of each STATE_GROUPS group.
       scripts/eval_rollouts.py), normalize the prediction and the true s_{k+1} with the train state
       stats, and report the one step error on train and tuning. Each seed, and the mean and the
       sample std (ddof = 1, as in aggregate_seeds.py) over the 5 seeds.
+      Extra world model runs of src/train.py given on the command line (MLP or transformer, trained on
+      DATASET) get the same one step error, one row per run and split after the mean and std (they are
+      not in the mean and std). For a transformer run the network gets the windows of the true states
+      and actions s_{k-n+1}, ..., s_k and a_{k-n+1}, ..., a_k (window_transitions() from train.py, the
+      run's history n), and the prediction is s_k + denormalize(output, "delta"), as make_step does.
 Nothing is selected here.
 
-Usage: python scripts/readout_controls.py
+Usage: python scripts/readout_controls.py [results/train/<world model run> ...]
 Output: results/<YYYY-MM-DD_HHMMSS>_readout_controls/ with summary.csv and meta.json.
 """
 
+import argparse
 import datetime
 import json
 import os
@@ -36,10 +42,10 @@ from eval.probe import fit_linear_probe, apply_probe, fit_mlp_probe, apply_mlp_p
 from eval_rollouts import load_mlp_step, DATASET  # noqa: E402
 from features import STATE_GROUPS  # noqa: E402
 from models.jepa import JEPA  # noqa: E402
-from models.mlp import normalize  # noqa: E402
+from models.mlp import normalize, denormalize  # noqa: E402
 from probe_diagnostics import per_feature_mse, group_means  # noqa: E402
 from score_jepa import embed  # noqa: E402
-from train import set_seed  # noqa: E402
+from train import set_seed, make_model, window_transitions, outputs  # noqa: E402
 from train_jepa import pairs  # noqa: E402
 
 EMBED_DIMS = [64, 128, 256]
@@ -60,7 +66,7 @@ COLUMNS = ["part", "model", "probe", "split", "all"] + list(STATE_GROUPS)
 def error_row(part, model, probe, split, feature_mse):
     """One row of summary.csv: the mean over all 34 features and the mean of each group."""
     return {"part": part, "model": model, "probe": probe, "split": split,
-            "all": float(feature_mse.mean()), **group_means(feature_mse)}
+            "all": float(feature_mse.mean()), **group_means(feature_mse, STATE_GROUPS)}
 
 
 def standardize(z_train, z_tune):
@@ -83,6 +89,57 @@ def one_step_mse(step, data, split):
     a = data["actions"][runs][valid]           # a_k      (n, 12) raw
     pred = step(s, a)
     return per_feature_mse(normalize(pred, data, "state"), normalize(s_next, data, "state"))
+
+
+def load_transformer(run_dir, device):
+    """The transformer world model saved by src/train.py in run_dir, in eval mode on device.
+
+    Raises ValueError if the run was trained on a different dataset than DATASET.
+    """
+    with open(os.path.join(run_dir, "config.yaml"), "r") as f:
+        cfg = yaml.safe_load(f)
+    if os.path.normpath(cfg["dataset"]) != os.path.normpath(DATASET):
+        raise ValueError(f"{run_dir} was trained on {cfg['dataset']}, but this script evaluates {DATASET}")
+    saved = torch.load(os.path.join(run_dir, "model.pt"), map_location=device)
+    model = make_model("transformer", saved["state_dim"], saved["width"], saved["depth"], saved["history"])
+    model.load_state_dict(saved["state_dict"])
+    model.to(device).eval()
+    return model
+
+
+def transformer_one_step_mse(model, data, split, device):
+    """The one_step_mse of a transformer world model: per feature (state_dim,) mean over the valid
+    transitions of split of the one step squared error, in normalized state units.
+
+    The network gets the true state and action windows of each pair (window_transitions() at
+    model.history, the same pairs in the same order as one_step_mse), the prediction is
+    s_k + denormalize(output, "delta") in float64 (as in make_step), and the prediction and the true
+    s_{k+1} are normalized with the train state stats before the error is taken.
+    """
+    runs = data["split"] == split
+    states, valid = data["states"][runs], data["valid"][runs]
+    s = states[:, :-1][valid]                  # s_k      (n, state_dim) raw
+    s_next = states[:, 1:][valid]              # s_{k+1}  (n, state_dim) raw
+    x, _ = window_transitions(data, split, model.history)
+    x = tuple(torch.from_numpy(v).to(device) for v in x)
+    with torch.no_grad():
+        out = outputs(model, x).cpu().numpy()
+    pred = s + denormalize(out, data, "delta")
+    return per_feature_mse(normalize(pred, data, "state"), normalize(s_next, data, "state"))
+
+
+def world_model_rows(run_dir, data, device):
+    """(b) rows (train, then tuning) of the one step error of one world model run of src/train.py.
+
+    model.pt says whether it is an MLP or a transformer run (checkpoints saved before model existed are MLP).
+    """
+    name = os.path.basename(os.path.normpath(run_dir))
+    if torch.load(os.path.join(run_dir, "model.pt"), map_location="cpu").get("model", "mlp") == "mlp":
+        step = load_mlp_step(run_dir, data, device)  # checks the dataset
+        return [error_row("b", name, "none", split, one_step_mse(step, data, split)) for split in ["train", "tuning"]]
+    model = load_transformer(run_dir, device)        # checks the dataset
+    return [error_row("b", name, "none", split, transformer_one_step_mse(model, data, split, device))
+            for split in ["train", "tuning"]]
 
 
 def random_encoder_rows(data, device):
@@ -119,9 +176,7 @@ def mlp_world_model_rows(data, device):
             cfg = yaml.safe_load(f)
         assert (cfg["width"], cfg["depth"], cfg["lr"], cfg["epochs"], cfg["seed"]) == (WIDTH, DEPTH, 0.001, 100, seed), \
             (run_dir, cfg)
-        step = load_mlp_step(os.path.join(REPO_ROOT, run_dir), data, device)  # checks the dataset
-        for split in ["train", "tuning"]:
-            rows.append(error_row("b", os.path.basename(run_dir), "none", split, one_step_mse(step, data, split)))
+        rows += world_model_rows(os.path.join(REPO_ROOT, run_dir), data, device)
     for split in ["train", "tuning"]:
         seed_rows = [r for r in rows if r["split"] == split]
         mean_row = {"part": "b", "model": "mlp_mean_over_seeds", "probe": "none", "split": split}
@@ -142,6 +197,9 @@ def print_table(rows):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("run_dirs", nargs="*", help="extra results/train/<world model run> for (b)")
+    args = parser.parse_args()
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out_dir = os.path.join(REPO_ROOT, "results", f"{stamp}_readout_controls")
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite
@@ -157,6 +215,9 @@ def main():
     rows = random_encoder_rows(data, device)
     print("(b) MLP world model one step error")
     rows += mlp_world_model_rows(data, device)
+    for run_dir in args.run_dirs:
+        print(f"  extra run {run_dir}")
+        rows += world_model_rows(os.path.join(REPO_ROOT, run_dir), data, device)
 
     with open(os.path.join(out_dir, "summary.csv"), "w") as f:
         f.write(",".join(COLUMNS) + "\n")
@@ -169,6 +230,7 @@ def main():
         "git_uncommitted_changes": dirty,
         "dataset": DATASET,
         "run_dirs": MLP_RUNS,
+        "extra_run_dirs": args.run_dirs,
     }
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)

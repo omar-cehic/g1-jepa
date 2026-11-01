@@ -9,6 +9,11 @@ dataset: data/processed/2026-10-07_182522/dataset.npz
 width: 1024
 depth: 3
 
+# network: mlp (make_mlp on [s_k, a_k]) or transformer (on the windows of s and a, see src/train.py)
+model: mlp
+# number of steps the transformer sees (s_j, a_j for j = k-history+1, ..., k), 1 to 50; must be 1 for mlp
+history: 1
+
 # AdamW on all parameters
 # lr chosen by the lr check at width 1024 (0.0003, 0.001, 0.003): lowest final tuning loss, seed 0, 100 epochs
 lr: 0.001
