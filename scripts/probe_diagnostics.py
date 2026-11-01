@@ -2,7 +2,8 @@
 
 For each run folder (written by src/train_jepa.py), with the frozen JEPA and the train and tuning
 pairs built exactly as in scripts/score_jepa.py (embeddings computed once, JEPA never updated,
-probes fitted on train only; predictions use the run's history, present errors encode s_k alone).
+probes fitted on train only; predictions use the run's history and predictor type, present errors
+encode s_k alone).
 All errors are squared errors in normalized state units.
   (a) Per feature: fit the linear probe and the default MLP probe (seed 0) encode(s_k) -> s_k on
       train. On tuning, the present error of each state feature (mean over pairs) for both
@@ -80,12 +81,12 @@ def diagnose_run(run_dir, device):
     else:
         names, groups = STATE_NAMES, STATE_GROUPS
     model = load_jepa(run_dir, device)
-    states, rows, a = window_pairs(data, "train", model.history)
+    states, rows, a, actions = window_pairs(data, "train", model.history)
     s_train = states[rows]
-    z_train, _ = embed_windows(model, states, rows, a, device)
-    states, rows, a = window_pairs(data, "tuning", model.history)
+    z_train, _ = embed_windows(model, states, rows, a, actions, device)
+    states, rows, a, actions = window_pairs(data, "tuning", model.history)
     s, s_next = states[rows], states[rows + 1]
-    z, z_hat = embed_windows(model, states, rows, a, device)
+    z, z_hat = embed_windows(model, states, rows, a, actions, device)
     s_train64, s64, s_next64 = (x.astype(np.float64) for x in (s_train, s, s_next))
     times["load_and_embed"] = time.time() - t
 

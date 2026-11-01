@@ -5,6 +5,8 @@ For each run folder (written by src/train_jepa.py):
   2. Build the train and tuning pairs (normalized s_k, a_k, s_{k+1}) with window_pairs() from
      train_jepa.py, at the run's history (from model.pt; 1 for checkpoints saved before history existed).
      They are the same pairs as pairs(); the older states of each window only enter predict().
+     The predictor type also comes from model.pt ("mlp" for checkpoints saved before it existed); the
+     transformer predictor gets the action windows a_{k-history+1}, ..., a_k, the mlp predictor a_k.
   3. Fit a linear probe and an MLP probe encode(s_k) -> s_k on the train pairs (src/eval/probe.py).
      The embeddings are computed once by the frozen JEPA; the JEPA is never updated.
      The tuning split is never used for fitting.
@@ -41,7 +43,7 @@ sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from build_dataset import git_commit  # noqa: E402
 from eval.probe import fit_linear_probe, apply_probe, fit_mlp_probe, apply_mlp_probe  # noqa: E402
 from models.jepa import JEPA  # noqa: E402
-from train_jepa import window_pairs, gather_windows, encode_past  # noqa: E402
+from train_jepa import window_pairs, gather_windows, encode_past, predictor_actions  # noqa: E402
 
 BATCH_SIZE = 16384   # pairs per forward pass; only affects speed and GPU memory
 COLUMNS = ["folder", "embed_dim", "sigreg_weight", "lr", "seed", "epochs", "score", "present_mse",
@@ -52,12 +54,12 @@ COLUMNS = ["folder", "embed_dim", "sigreg_weight", "lr", "seed", "epochs", "scor
 def load_jepa(run_dir, device):
     """The JEPA saved by src/train_jepa.py in run_dir, in eval mode on device.
 
-    Checkpoints saved before state_dim was stored are base state runs (34), and before history was
-    stored runs without history (1).
+    Checkpoints saved before state_dim was stored are base state runs (34), before history was
+    stored runs without history (1), and before predictor was stored mlp predictor runs.
     """
     saved = torch.load(os.path.join(run_dir, "model.pt"), map_location=device)
-    model = JEPA(saved["embed_dim"], saved["width"], saved["depth"],
-                 state_dim=saved.get("state_dim", 34), history=saved.get("history", 1)).to(device)
+    model = JEPA(saved["embed_dim"], saved["width"], saved["depth"], state_dim=saved.get("state_dim", 34),
+                 history=saved.get("history", 1), predictor=saved.get("predictor", "mlp")).to(device)
     model.load_state_dict(saved["state_dict"])
     model.eval()
     return model
@@ -77,10 +79,11 @@ def embed(model, s, a, device):
     return np.concatenate(z_parts), np.concatenate(z_hat_parts)
 
 
-def embed_windows(model, states, rows, a, device):
+def embed_windows(model, states, rows, a, actions, device):
     """z = encode(s_k) and z_hat = predict(z, a_k, z_past) as float64 numpy arrays, computed in batches.
 
-    states, rows, a are from window_pairs() at model.history. s_k = states[rows] is encoded alone,
+    states, rows, a, actions are from window_pairs() at model.history; the transformer predictor gets the
+    action windows instead of a_k (predictor_actions()). s_k = states[rows] is encoded alone,
     as in embed(); the older states of each window are encoded only for z_past. A batch has
     BATCH_SIZE // history pairs, so about BATCH_SIZE states go through the encoder per pass. With
     history 1, z and z_hat are exactly those of embed() on the same pairs.
@@ -89,13 +92,15 @@ def embed_windows(model, states, rows, a, device):
     batch_size = BATCH_SIZE // history
     states = torch.from_numpy(states).to(device)
     rows = torch.from_numpy(rows).to(device)
+    actions = torch.from_numpy(actions).to(device)
     z_parts, z_hat_parts = [], []
     with torch.no_grad():
         for start in range(0, len(rows), batch_size):
             r = rows[start:start + batch_size]
             a_batch = torch.from_numpy(a[start:start + batch_size]).to(device)
             z = model.encode(states[r])
-            z_hat = model.predict(z, a_batch, encode_past(model, gather_windows(states, r, history)))
+            z_hat = model.predict(z, predictor_actions(model, a_batch, actions, r),
+                                  encode_past(model, gather_windows(states, r, history)))
             z_parts.append(z.cpu().numpy().astype(np.float64))
             z_hat_parts.append(z_hat.cpu().numpy().astype(np.float64))
     return np.concatenate(z_parts), np.concatenate(z_hat_parts)
@@ -114,15 +119,15 @@ def score_run(run_dir, device):
     data = dict(np.load(os.path.join(REPO_ROOT, cfg["dataset"])))
     model = load_jepa(run_dir, device)
 
-    states, rows, a = window_pairs(data, "train", model.history)
+    states, rows, a, actions = window_pairs(data, "train", model.history)
     s_train = states[rows]
-    z_train, _ = embed_windows(model, states, rows, a, device)
+    z_train, _ = embed_windows(model, states, rows, a, actions, device)
     W, b = fit_linear_probe(z_train, s_train.astype(np.float64))
     mlp_probe = fit_mlp_probe(z_train, s_train, device, seed=0)
     del z_train  # free memory before the tuning pass
 
-    states, rows, a = window_pairs(data, "tuning", model.history)
-    z, z_hat = embed_windows(model, states, rows, a, device)
+    states, rows, a, actions = window_pairs(data, "tuning", model.history)
+    z, z_hat = embed_windows(model, states, rows, a, actions, device)
     s, s_next = states[rows].astype(np.float64), states[rows + 1].astype(np.float64)
     log = read_log(run_dir)
     return {

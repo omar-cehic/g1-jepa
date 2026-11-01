@@ -45,6 +45,19 @@ State history:
     states is exactly zero.
 (m) Predictor weight counts at embed_dim 256 for history 1, 3, 10 and 40 (printed; history 1 is the
     2,637,056 of (a)).
+Transformer predictor:
+(n) Weight count of the transformer predictor at embed_dim 256, width 1024, depth 3, for history 10 and
+    50 (printed, and checked against the count by hand).
+(o) Residual: with the final Linear's weight and bias zeroed, predict(z, a_window, z_past) == z exactly.
+(p) Positions: swapping window slots 0 and 1 (embedding and action together) changes the output. As a
+    control, with the position vectors set to zero the same swap gives the same output up to float
+    rounding (attention alone does not see the order of the older slots).
+(q) Action windows: at history 10 and 50, for the first, middle and last pair of each of the first 3 train
+    runs, gather_windows(actions, rows, n) equals the hand normalized stored actions at rows k-n+1, ..., k
+    of that run, and its last row is a_k of window_pairs(). At history 50, no action window of any train
+    or tuning pair contains NaN (the NaN row is the last state of each run, which has no action).
+(r) Loss at history 10 with the transformer on one real batch of 512: the SIGReg value is exactly the one
+    of z_k and z_{k+1} encoded alone, and pred_loss matches a hand computation.
 
 Nothing is written. Run: python tests/test_jepa.py
 """
@@ -206,13 +219,13 @@ def test_fixed_batch(data):
 
 
 def test_determinism(data):
-    states, rows, a = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", 1))
+    states, rows, a, actions = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", 1))
     cfg = dict(CFG, embed_dim=64, batch_size=64, epochs=2, warmup_epochs=1)   # 2 x 10 = 20 steps
     print("    determinism runs:")
     weights = []
     for seed in [0, 0, 1]:
-        model, _ = train_jepa.train(dict(cfg, seed=seed), (states, rows[:640], a[:640]),
-                                    (states, rows[:128], a[:128]), CPU)
+        model, _ = train_jepa.train(dict(cfg, seed=seed), (states, rows[:640], a[:640], actions),
+                                    (states, rows[:128], a[:128], actions), CPU)
         weights.append(model.state_dict())
     same = all(torch.equal(weights[0][k], weights[1][k]) for k in weights[0])
     different = not any(torch.equal(weights[0][k], weights[2][k]) for k in weights[0])
@@ -280,7 +293,7 @@ def test_window_pairs(data):
         s, a, s_next = train_jepa.pairs(data, split)
         rows_1 = None
         for history in [1, 3, 10, 40]:
-            states, rows, a_w = train_jepa.window_pairs(data, split, history)
+            states, rows, a_w, _ = train_jepa.window_pairs(data, split, history)
             assert states.dtype == a_w.dtype == np.float32 and rows.dtype == np.int64
             assert len(rows) == n_expected and a_w.shape == (n_expected, 12), (split, history, len(rows))
             if rows_1 is None:
@@ -305,7 +318,7 @@ def test_windows(data):
     s_pairs, _, _ = train_jepa.pairs(data, "train")
     runs = np.flatnonzero(data["split"] == "train")[:3]
     for history in [10, 40]:
-        states, rows, _ = train_jepa.window_pairs(data, "train", history)
+        states, rows, _, _ = train_jepa.window_pairs(data, "train", history)
         windows = train_jepa.gather_windows(torch.from_numpy(states), torch.from_numpy(rows), history).numpy()
         offset, n_checked, n_with_invalid = 0, 0, 0
         for run in runs:
@@ -344,7 +357,7 @@ def test_residual_history():
 
 
 def test_loss_history(data):
-    states, rows, a = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", 10))
+    states, rows, a, _ = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", 10))
     r = rows[:512]
     s = train_jepa.gather_windows(states, r, 10).requires_grad_()
     s_next, a = states[r + 1], a[:512]
@@ -381,6 +394,102 @@ def test_history_weight_counts():
           + ", ".join(f"history {h} {c:,}" for h, c in counts.items()))
 
 
+def test_transformer_weight_counts():
+    d, w = 256, 1024
+    block = (3 * d * d + 3 * d) + (d * d + d) + (d * w + w) + (w * d + d) + 4 * d   # attention, ff, 2 LayerNorms
+    counts = []
+    for history in [10, 50]:
+        count = n_params(JEPA(d, w, 3, history=history, predictor="transformer").predictor)
+        expected = ((d + 12) * d + d) + history * d + 3 * block + 2 * d + (d * d + d)
+        assert count == expected, (history, count, expected)
+        counts.append(f"history {history} {count:,}")
+    print(f"(n) transformer predictor weights at embed_dim {d}, width {w}, depth 3: " + ", ".join(counts)
+          + f" (mlp predictor at history 1: 2,637,056)")
+
+
+def test_transformer_residual():
+    torch.manual_seed(0)
+    model = JEPA(64, 1024, 3, history=10, predictor="transformer")
+    with torch.no_grad():
+        model.predictor.out.weight.zero_()
+        model.predictor.out.bias.zero_()
+    z, z_past, a = torch.randn(100, 64), torch.randn(100, 9, 64), torch.randn(100, 10, 12)
+    z_hat = model.predict(z, a, z_past)
+    assert torch.equal(z_hat, z)
+    print("(o) transformer, history 10, final Linear zeroed: predict(z, a_window, z_past) == z exactly")
+
+
+def test_transformer_positions():
+    torch.manual_seed(0)
+    model = JEPA(64, 1024, 3, history=10, predictor="transformer")
+    z, z_past, a = torch.randn(100, 64), torch.randn(100, 9, 64), torch.randn(100, 10, 12)
+    swap = [1, 0] + list(range(2, 9))                     # swap slots 0 and 1 of the older slots
+    a_swap = a[:, swap + [9]]
+    with torch.no_grad():
+        out = model.predict(z, a, z_past)
+        out_swap = model.predict(z, a_swap, z_past[:, swap])
+        diff = (out - out_swap).abs().max().item()
+        model.predictor.position.zero_()
+        control = (model.predict(z, a, z_past) - model.predict(z, a_swap, z_past[:, swap])).abs().max().item()
+    assert diff > 1e-3, diff
+    assert control < 1e-5, control
+    print(f"(p) swapping window slots 0 and 1: max |change| {diff:.3e}; with the position vectors zeroed "
+          f"{control:.1e} (float rounding)")
+
+
+def test_action_windows(data):
+    _, _, a_pairs, _ = train_jepa.window_pairs(data, "train", 1)
+    runs = np.flatnonzero(data["split"] == "train")[:3]
+    for history in [10, 50]:
+        states, rows, a, actions = train_jepa.window_pairs(data, "train", history)
+        assert np.array_equal(a, a_pairs)
+        windows = train_jepa.gather_windows(torch.from_numpy(actions), torch.from_numpy(rows), history).numpy()
+        offset, n_checked = 0, 0
+        for run in runs:
+            ks = np.flatnonzero(data["valid"][run])
+            for i in sorted({0, len(ks) // 2, len(ks) - 1}):
+                k = ks[i]
+                hand = data["actions"][run][k - history + 1:k + 1]      # rows k-n+1, ..., k of this run
+                hand = ((hand - data["action_mean"]) / data["action_std"]).astype(np.float32)
+                window = windows[offset + i]
+                assert window.shape == (history, 12)
+                assert np.array_equal(window, hand), (history, run, k)
+                assert np.array_equal(window[-1], a[offset + i])
+                n_checked += 1
+            offset += len(ks)
+        print(f"(q) history {history}: {n_checked} action windows equal the hand normalized stored actions "
+              f"at rows k-{history - 1}..k, last row = a_k")
+    for split in ["train", "tuning"]:
+        _, rows, _, actions = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, split, 50))
+        assert torch.isnan(actions).any()                    # the last row of each run
+        for start in range(0, len(rows), 20000):
+            assert torch.isfinite(train_jepa.gather_windows(actions, rows[start:start + 20000], 50)).all()
+        print(f"    history 50, {split}: no NaN in the action windows of all {len(rows)} pairs")
+
+
+def test_transformer_loss(data):
+    states, rows, a, actions = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", 10))
+    r = rows[:512]
+    s, s_next = train_jepa.gather_windows(states, r, 10), states[r + 1]
+    torch.manual_seed(0)
+    model = JEPA(64, 1024, 3, history=10, predictor="transformer")
+    sigreg = SIGReg()
+    a_window = train_jepa.predictor_actions(model, a[:512], actions, r)
+    assert a_window.shape == (512, 10, 12)
+    torch.manual_seed(1)
+    pred_loss, sig = train_jepa.jepa_losses(model, sigreg, s, a_window, s_next)
+    with torch.no_grad():
+        z, z_next = model.encode(s[:, -1]), model.encode(s_next)
+        z_window = torch.stack([model.encode(s[:, j]) for j in range(10)], dim=1)
+        hand_pred = (z + model.predictor(z_window, a_window) - z_next).square().mean()
+        torch.manual_seed(1)
+        hand_sig = sigreg(torch.stack([z, z_next]))
+    assert torch.equal(sig, hand_sig), (sig.item(), hand_sig.item())
+    assert torch.allclose(pred_loss, hand_pred, rtol=1e-5, atol=0), (pred_loss.item(), hand_pred.item())
+    print(f"(r) transformer, history 10, 512 real pairs: SIGReg {sig.item():.4f} == SIGReg of z_k, z_k+1 "
+          f"alone; pred_loss {pred_loss.item():.6f} vs hand {hand_pred.item():.6f}")
+
+
 def main():
     data = dict(np.load(DATASET))
     test_shapes()
@@ -396,6 +505,11 @@ def main():
     test_residual_history()
     test_loss_history(data)
     test_history_weight_counts()
+    test_transformer_weight_counts()
+    test_transformer_residual()
+    test_transformer_positions()
+    test_action_windows(data)
+    test_transformer_loss(data)
     print("PASS test_jepa")
 
 

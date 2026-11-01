@@ -29,16 +29,26 @@ SIGReg still gets the undetached z and z_next, and the loss value is the same as
 SIGReg multiplies its value by the batch size B, so on the last partial batch of each epoch
 (226,099 = 441 * 512 + 307 pairs) it is multiplied by 307 instead of 512. This is kept on purpose.
 
+Transformer predictor (predictor: transformer in the config, --predictor transformer; "mlp" by
+default and when the key is missing): see src/models/jepa.py. The encoder, the windows of states,
+the pairs, the loss and SIGReg are the same; the predictor gets the window of embeddings z_{k-n+1},
+..., z_k and the window of actions a_{k-n+1}, ..., a_k (gathered by index like the states, from the
+actions of window_pairs()) instead of a_k alone. With predictor "mlp" everything is exactly the
+computation without this option.
+
 Everything else is the same as src/train.py (MLP): AdamW on all parameters, lr warmup + cosine
 per step, gradient norm clipped at grad_clip every step, batch_size with the last partial batch
 kept, shuffling with a seeded CPU generator. The saved model is the one after the last epoch.
 
 Usage: python src/train_jepa.py configs/train_jepa.yaml [--seed S] [--embed_dim D]
                                 [--sigreg_weight W] [--lr LR] [--epochs E] [--stop_grad] [--history N]
+                                [--predictor mlp|transformer]
 Output: results/train/<YYYY-MM-DD_HHMMSS>_jepa_d<embed_dim>_sw<sigreg_weight>_lr<lr>_s<seed>/
         with config.yaml, model.pt, log.csv, meta.json.
         With stop_grad on, "_sg" goes before "_s<seed>" (..._lr0.001_sg_s0).
         With history above 1, "_h<history>" goes right before "_s<seed>" (..._lr0.001_h10_s0).
+        With the transformer predictor, "_tf" goes right before "_h<history>" (..._lr0.001_tf_h10_s0),
+        or before "_s<seed>" at history 1.
         On a full state dataset (state_type "full" in its meta.json) "jepa" becomes "jepa_full",
         and "jepa_fullnoxy" for state_type "full_no_xy".
 """
@@ -59,7 +69,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 from build_dataset import git_commit  # noqa: E402
 from models.mlp import normalize  # noqa: E402
-from models.jepa import JEPA  # noqa: E402
+from models.jepa import JEPA, ACTION_DIM  # noqa: E402
 from models.sigreg import SIGReg  # noqa: E402
 from train import check_config, set_seed, lr_factor, dataset_state_type  # noqa: E402
 
@@ -80,6 +90,7 @@ def check_jepa_config(cfg):
     assert 1 <= cfg["history"] <= MAX_HISTORY, (
         f"history = {cfg['history']} is not between 1 and {MAX_HISTORY}: the first valid pair of a run "
         f"is at k = 49, so a longer window would reach before the start of the run")
+    assert cfg["predictor"] in ["mlp", "transformer"], f"predictor = {cfg['predictor']!r} is not mlp or transformer"
 
 
 def pairs(data, split):
@@ -96,11 +107,15 @@ def window_pairs(data, split, history):
     """The valid transitions of one split, with what is needed to gather state windows by index.
 
     Returns, float32 / int64:
-      states (n_runs * steps, state_dim)  normalized states of the split's runs, run after run
-      rows   (n,)                         row of s_k in states for each valid pair, in the order of pairs()
-      a      (n, 12)                      normalized a_k
+      states  (n_runs * steps, state_dim)  normalized states of the split's runs, run after run
+      rows    (n,)                         row of s_k in states for each valid pair, in the order of pairs()
+      a       (n, 12)                      normalized a_k
+      actions (n_runs * steps, 12)         normalized actions of the split's runs, in the same rows as states
     s_k is states[rows], s_{k+1} is states[rows + 1], and the window s_{k-history+1}, ..., s_k is
-    gather_windows(states, rows, history). Raises if a window would start before the first step of its run.
+    gather_windows(states, rows, history); the action window a_{k-history+1}, ..., a_k is
+    gather_windows(actions, rows, history). Raises if a window would start before the first step of its run.
+    A run has steps states but steps - 1 actions: the last state of a run has no action, and its row in
+    actions is NaN. No window reaches it, since the last valid k is steps - 2 (valid has steps - 1 columns).
     """
     runs = data["split"] == split
     states, valid = data["states"][runs], data["valid"][runs]
@@ -111,7 +126,10 @@ def window_pairs(data, split, history):
     rows = run * steps + k
     states = normalize(states.reshape(n_runs * steps, states.shape[2]), data, "state")
     a = normalize(data["actions"][runs][valid], data, "action")
-    return states.astype(np.float32), rows.astype(np.int64), a.astype(np.float32)
+    actions = np.full((n_runs, steps, ACTION_DIM), np.nan)
+    actions[:, :-1] = data["actions"][runs]          # steps - 1 actions per run; the last row stays NaN
+    actions = normalize(actions.reshape(n_runs * steps, ACTION_DIM), data, "action")
+    return states.astype(np.float32), rows.astype(np.int64), a.astype(np.float32), actions.astype(np.float32)
 
 
 def gather_windows(states, rows, history):
@@ -121,6 +139,14 @@ def gather_windows(states, rows, history):
     """
     offsets = torch.arange(1 - history, 1, device=rows.device)   # -history+1, ..., 0
     return states[rows[:, None] + offsets]
+
+
+def predictor_actions(model, a, actions, rows):
+    """The actions predict() takes for the pairs whose s_k are at rows: a, their a_k (B, 12), for the
+    mlp predictor; the action windows a_{k-history+1}, ..., a_k (B, history, 12) for the transformer."""
+    if model.predictor_type == "transformer":
+        return gather_windows(actions, rows, model.history)
+    return a
 
 
 def encode_past(model, s):
@@ -134,7 +160,8 @@ def jepa_losses(model, sigreg, s, a, s_next, stop_grad=False):
 
     s is the state window of each pair (B, history, state_dim), oldest first and s_k last; with
     history 1 it can also be s_k alone (B, state_dim). Every window state is encoded and gets
-    gradients; SIGReg gets only z_k and z_{k+1}.
+    gradients; SIGReg gets only z_k and z_{k+1}. a is what predict() takes: a_k (B, 12) for the mlp
+    predictor, the action window (B, history, 12) for the transformer (predictor_actions()).
     z_k is encoded on its own (not as part of the window), so with history 1 the computation,
     including the order in which autograd adds up gradients, is exactly the one without history.
     With stop_grad, the target z_next is detached in pred_loss only; SIGReg gets the undetached z_next.
@@ -166,10 +193,10 @@ def train_step(model, sigreg, optimizer, s, a, s_next, sigreg_weight, grad_clip,
     return pred_loss.item(), sig.item(), loss.item(), grad_norm.item() > grad_clip
 
 
-def evaluate(model, sigreg, states, rows, a, batch_size, tuning_order):
+def evaluate(model, sigreg, states, rows, a, actions, batch_size, tuning_order):
     """tuning_pred_loss, tuning_sigreg and tuning_emb_std on the full tuning set (no gradients).
 
-    states, rows, a are from window_pairs() (tensors on the device).
+    states, rows, a, actions are from window_pairs() (tensors on the device).
     tuning_pred_loss is computed in chunks of EVAL_STATES // history pairs, so the windows of one
     chunk fit in memory; with history 1 the whole tuning set is one chunk.
     tuning_sigreg is the mean over the full batches of batch_size taken in tuning_order (a fixed
@@ -185,7 +212,7 @@ def evaluate(model, sigreg, states, rows, a, batch_size, tuning_order):
             r = rows[start:start + chunk]
             z = model.encode(states[r])
             z_past = encode_past(model, gather_windows(states, r, history))
-            z_hat = model.predict(z, a[start:start + chunk], z_past)
+            z_hat = model.predict(z, predictor_actions(model, a[start:start + chunk], actions, r), z_past)
             zs.append(z)
             squared_errors.append((z_hat - model.encode(states[r + 1])).square())
         pred_loss = torch.cat(squared_errors).mean().item()
@@ -198,17 +225,18 @@ def evaluate(model, sigreg, states, rows, a, batch_size, tuning_order):
 
 
 def train(cfg, train_data, tuning_data, device):
-    """Train a fresh JEPA. train_data and tuning_data are (states, rows, a) from window_pairs(), as
-    tensors already on device.
+    """Train a fresh JEPA. train_data and tuning_data are (states, rows, a, actions) from window_pairs(),
+    as tensors already on device.
 
-    A cfg without a stop_grad key trains with stop_grad off, and without a history key with history 1.
+    A cfg without a stop_grad key trains with stop_grad off, without a history key with history 1, and
+    without a predictor key with the mlp predictor.
     Returns the final model and the epoch log.
     """
-    states, rows, a_train = train_data
+    states, rows, a_train, actions = train_data
     history = cfg.get("history", 1)
     set_seed(cfg["seed"])
     model = JEPA(cfg["embed_dim"], cfg["width"], cfg["depth"], state_dim=states.shape[1],
-                 history=history).to(device)
+                 history=history, predictor=cfg.get("predictor", "mlp")).to(device)
     sigreg = SIGReg().to(device)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     n, batch_size = len(rows), cfg["batch_size"]
@@ -231,7 +259,8 @@ def train(cfg, train_data, tuning_data, device):
             idx = order[start:start + batch_size]
             r = rows[idx]
             pred_loss, sig, loss, clipped = train_step(
-                model, sigreg, optimizer, gather_windows(states, r, history), a_train[idx], states[r + 1],
+                model, sigreg, optimizer, gather_windows(states, r, history),
+                predictor_actions(model, a_train[idx], actions, r), states[r + 1],
                 cfg["sigreg_weight"], cfg["grad_clip"], cfg.get("stop_grad", False))
             scheduler.step()
             pred_sum += pred_loss * len(idx)           # weight by batch size: the last batch is smaller
@@ -271,12 +300,14 @@ def main():
     parser.add_argument("--epochs", type=int)
     parser.add_argument("--stop_grad", action="store_true", default=None)  # None when not given
     parser.add_argument("--history", type=int)
+    parser.add_argument("--predictor", choices=["mlp", "transformer"])
     args = parser.parse_args()
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
     cfg.setdefault("stop_grad", False)  # configs without the key: off (saved in config.yaml)
     cfg.setdefault("history", 1)        # configs without the key: 1 (saved in config.yaml)
-    for key in ["seed", "embed_dim", "sigreg_weight", "lr", "epochs", "stop_grad", "history"]:
+    cfg.setdefault("predictor", "mlp")  # configs without the key: mlp (saved in config.yaml)
+    for key in ["seed", "embed_dim", "sigreg_weight", "lr", "epochs", "stop_grad", "history", "predictor"]:
         if getattr(args, key) is not None:
             cfg[key] = getattr(args, key)
     check_jepa_config(cfg)
@@ -284,9 +315,10 @@ def main():
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     full = {"base": "", "full": "_full", "full_no_xy": "_fullnoxy"}[dataset_state_type(cfg["dataset"])]
     sg = "_sg" if cfg["stop_grad"] else ""
+    tf = "_tf" if cfg["predictor"] == "transformer" else ""
     h = f"_h{cfg['history']}" if cfg["history"] > 1 else ""
     name = (f"{stamp}_jepa{full}_d{cfg['embed_dim']}_sw{cfg['sigreg_weight']:g}"
-            f"_lr{cfg['lr']:g}{sg}{h}_s{cfg['seed']}")
+            f"_lr{cfg['lr']:g}{sg}{tf}{h}_s{cfg['seed']}")
     out_dir = os.path.join(REPO_ROOT, "results", "train", name)
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite
     with open(os.path.join(out_dir, "config.yaml"), "w") as f:
@@ -298,7 +330,8 @@ def main():
     data = dict(np.load(os.path.join(REPO_ROOT, cfg["dataset"])))
     train_data = [torch.from_numpy(x).to(device) for x in window_pairs(data, "train", cfg["history"])]
     tuning_data = [torch.from_numpy(x).to(device) for x in window_pairs(data, "tuning", cfg["history"])]
-    print(f"train pairs {len(train_data[1])}, tuning pairs {len(tuning_data[1])}, history {cfg['history']}")
+    print(f"train pairs {len(train_data[1])}, tuning pairs {len(tuning_data[1])}, history {cfg['history']}, "
+          f"predictor {cfg['predictor']}")
 
     model, log = train(cfg, train_data, tuning_data, device)
 
@@ -306,7 +339,7 @@ def main():
     state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
     torch.save({"state_dict": state_dict, "embed_dim": cfg["embed_dim"],
                 "width": cfg["width"], "depth": cfg["depth"], "state_dim": train_data[0].shape[1],
-                "history": cfg["history"]},
+                "history": cfg["history"], "predictor": cfg["predictor"]},
                os.path.join(out_dir, "model.pt"))
     with open(os.path.join(out_dir, "log.csv"), "w") as f:
         f.write(",".join(LOG_COLUMNS) + "\n")
