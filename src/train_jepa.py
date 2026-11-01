@@ -21,13 +21,24 @@ One step on a batch of B pairs:
   pred_loss = mean over batch and embedding numbers of (z_hat - z_next)^2
   sigreg    = SIGReg()(stack([z, z_next]))     input shape (2, B, embed_dim); z_past is not in it
   loss      = pred_loss + sigreg_weight * sigreg
-Gradients flow through every embedding of the window and z_next: nothing is detached, there is no EMA
-target encoder.
+Gradients flow through every embedding of the window and z_next: nothing is detached, and by default
+there is no EMA target encoder.
 With --stop_grad (stop_grad: true in the config; off by default, and off when the key is missing)
 the target z_next in pred_loss is detached, so pred_loss sends no gradient through encode(s_{k+1}).
 SIGReg still gets the undetached z and z_next, and the loss value is the same as without it.
 SIGReg multiplies its value by the batch size B, so on the last partial batch of each epoch
 (226,099 = 441 * 512 + 307 pairs) it is multiplied by 307 instead of 512. This is kept on purpose.
+
+EMA target encoder (--ema_tau tau, config key ema_tau; 0.0 = off by default and when the key is missing;
+0 <= tau < 1, and not together with stop_grad): training keeps a target copy of the encoder. It starts
+equal to the encoder, has no gradients and is not in the optimizer. After every optimizer step each of
+its parameters becomes tau * target + (1 - tau) * encoder. The target of pred_loss is then
+target_encoder(s_{k+1}), computed under torch.no_grad(); the predictor's inputs (z_k and the window)
+come from the online encoder, and SIGReg still gets the online z_k and z_{k+1} (so the online encoder
+still encodes s_{k+1}). tuning_pred_loss in the log is still measured against the online encoder.
+Only the online model is saved. At the end of training, ema_gap (the mean squared difference of the
+online and target encoder outputs over all tuning states s_k) is printed and saved in meta.json.
+With ema_tau 0 everything is exactly the computation without this option.
 
 Transformer predictor (predictor: transformer in the config, --predictor transformer; "mlp" by
 default and when the key is missing): see src/models/jepa.py. The encoder, the windows of states,
@@ -42,10 +53,11 @@ kept, shuffling with a seeded CPU generator. The saved model is the one after th
 
 Usage: python src/train_jepa.py configs/train_jepa.yaml [--seed S] [--embed_dim D]
                                 [--sigreg_weight W] [--lr LR] [--epochs E] [--stop_grad] [--history N]
-                                [--predictor mlp|transformer]
+                                [--predictor mlp|transformer] [--ema_tau TAU]
 Output: results/train/<YYYY-MM-DD_HHMMSS>_jepa_d<embed_dim>_sw<sigreg_weight>_lr<lr>_s<seed>/
         with config.yaml, model.pt, log.csv, meta.json.
         With stop_grad on, "_sg" goes before "_s<seed>" (..._lr0.001_sg_s0).
+        With ema_tau above 0, "_ema" goes right after the lr part (..._lr0.001_ema_tf_h10_s0).
         With history above 1, "_h<history>" goes right before "_s<seed>" (..._lr0.001_h10_s0).
         With the transformer predictor, "_tf" goes right before "_h<history>" (..._lr0.001_tf_h10_s0),
         or before "_s<seed>" at history 1.
@@ -54,6 +66,7 @@ Output: results/train/<YYYY-MM-DD_HHMMSS>_jepa_d<embed_dim>_sw<sigreg_weight>_lr
 """
 
 import argparse
+import copy
 import datetime
 import json
 import math
@@ -91,6 +104,9 @@ def check_jepa_config(cfg):
         f"history = {cfg['history']} is not between 1 and {MAX_HISTORY}: the first valid pair of a run "
         f"is at k = 49, so a longer window would reach before the start of the run")
     assert cfg["predictor"] in ["mlp", "transformer"], f"predictor = {cfg['predictor']!r} is not mlp or transformer"
+    assert type(cfg["ema_tau"]) is float, f"ema_tau = {cfg['ema_tau']!r} is not a float"
+    assert 0.0 <= cfg["ema_tau"] < 1.0, f"ema_tau = {cfg['ema_tau']} is not in 0 <= tau < 1"
+    assert not (cfg["ema_tau"] > 0 and cfg["stop_grad"]), "ema_tau and stop_grad cannot be used together"
 
 
 def pairs(data, split):
@@ -155,7 +171,30 @@ def encode_past(model, s):
     return model.encode_window(s[:, :-1]) if s.shape[1] > 1 else None
 
 
-def jepa_losses(model, sigreg, s, a, s_next, stop_grad=False):
+def make_target_encoder(encoder):
+    """EMA target encoder: a copy of encoder, with requires_grad off (it is never given to the optimizer)."""
+    target = copy.deepcopy(encoder)
+    target.requires_grad_(False)
+    return target
+
+
+def ema_update(target_encoder, encoder, tau):
+    """In place, for each parameter: target = tau * target + (1 - tau) * encoder."""
+    with torch.no_grad():
+        for t, e in zip(target_encoder.parameters(), encoder.parameters()):
+            t.copy_(tau * t + (1 - tau) * e)
+
+
+def ema_gap(model, target_encoder, states, rows):
+    """Mean squared difference of the online and target encoder outputs over the states s_k = states[rows]
+    (mean over states and embedding numbers), in chunks of EVAL_STATES states."""
+    with torch.no_grad():
+        squared = [(model.encode(states[r]) - target_encoder(states[r])).square()
+                   for r in rows.split(EVAL_STATES)]
+    return torch.cat(squared).mean().item()
+
+
+def jepa_losses(model, sigreg, s, a, s_next, stop_grad=False, target_encoder=None):
     """pred_loss and SIGReg value (both tensors with gradients) on one batch.
 
     s is the state window of each pair (B, history, state_dim), oldest first and s_k last; with
@@ -165,6 +204,8 @@ def jepa_losses(model, sigreg, s, a, s_next, stop_grad=False):
     z_k is encoded on its own (not as part of the window), so with history 1 the computation,
     including the order in which autograd adds up gradients, is exactly the one without history.
     With stop_grad, the target z_next is detached in pred_loss only; SIGReg gets the undetached z_next.
+    With a target_encoder (EMA), the target in pred_loss is target_encoder(s_next) under torch.no_grad();
+    SIGReg still gets the online z_k and z_next.
     """
     if s.dim() == 2:                      # (B, state_dim): a window of one state
         s = s.unsqueeze(1)
@@ -172,24 +213,31 @@ def jepa_losses(model, sigreg, s, a, s_next, stop_grad=False):
     z_past = encode_past(model, s)
     z_next = model.encode(s_next)
     z_hat = model.predict(z, a, z_past)
-    if stop_grad:
+    if target_encoder is not None:
+        with torch.no_grad():
+            target = target_encoder(s_next)
+        pred_loss = (z_hat - target).square().mean()
+    elif stop_grad:
         pred_loss = (z_hat - z_next.detach()).square().mean()
     else:
         pred_loss = (z_hat - z_next).square().mean()
     return pred_loss, sigreg(torch.stack([z, z_next]))
 
 
-def train_step(model, sigreg, optimizer, s, a, s_next, sigreg_weight, grad_clip, stop_grad=False):
-    """One AdamW step on one batch.
+def train_step(model, sigreg, optimizer, s, a, s_next, sigreg_weight, grad_clip, stop_grad=False,
+               target_encoder=None, ema_tau=0.0):
+    """One AdamW step on one batch, then (with a target_encoder) the EMA update of the target encoder.
 
     Returns pred_loss, sigreg and total loss before the step, and whether clipping was active.
     """
-    pred_loss, sig = jepa_losses(model, sigreg, s, a, s_next, stop_grad)
+    pred_loss, sig = jepa_losses(model, sigreg, s, a, s_next, stop_grad, target_encoder)
     loss = pred_loss + sigreg_weight * sig
     optimizer.zero_grad()
     loss.backward()
     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)  # norm before clipping
     optimizer.step()
+    if target_encoder is not None:
+        ema_update(target_encoder, model.encoder, ema_tau)
     return pred_loss.item(), sig.item(), loss.item(), grad_norm.item() > grad_clip
 
 
@@ -228,9 +276,9 @@ def train(cfg, train_data, tuning_data, device):
     """Train a fresh JEPA. train_data and tuning_data are (states, rows, a, actions) from window_pairs(),
     as tensors already on device.
 
-    A cfg without a stop_grad key trains with stop_grad off, without a history key with history 1, and
-    without a predictor key with the mlp predictor.
-    Returns the final model and the epoch log.
+    A cfg without a stop_grad key trains with stop_grad off, without a history key with history 1,
+    without a predictor key with the mlp predictor, and without an ema_tau key with no EMA target encoder.
+    Returns the final model, the epoch log, and ema_gap on the tuning states (None when ema_tau is 0).
     """
     states, rows, a_train, actions = train_data
     history = cfg.get("history", 1)
@@ -238,6 +286,8 @@ def train(cfg, train_data, tuning_data, device):
     model = JEPA(cfg["embed_dim"], cfg["width"], cfg["depth"], state_dim=states.shape[1],
                  history=history, predictor=cfg.get("predictor", "mlp")).to(device)
     sigreg = SIGReg().to(device)
+    ema_tau = cfg.get("ema_tau", 0.0)
+    target_encoder = make_target_encoder(model.encoder) if ema_tau > 0 else None
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg["lr"], weight_decay=cfg["weight_decay"])
     n, batch_size = len(rows), cfg["batch_size"]
     steps_per_epoch = math.ceil(n / batch_size)       # the last partial batch is kept
@@ -261,7 +311,7 @@ def train(cfg, train_data, tuning_data, device):
             pred_loss, sig, loss, clipped = train_step(
                 model, sigreg, optimizer, gather_windows(states, r, history),
                 predictor_actions(model, a_train[idx], actions, r), states[r + 1],
-                cfg["sigreg_weight"], cfg["grad_clip"], cfg.get("stop_grad", False))
+                cfg["sigreg_weight"], cfg["grad_clip"], cfg.get("stop_grad", False), target_encoder, ema_tau)
             scheduler.step()
             pred_sum += pred_loss * len(idx)           # weight by batch size: the last batch is smaller
             sig_sum += sig * len(idx)
@@ -286,7 +336,12 @@ def train(cfg, train_data, tuning_data, device):
               f"sigreg {row['train_sigreg']:.3f} loss {row['train_loss']:.5f}  "
               f"tuning pred {tuning_pred_loss:.5f} sigreg {tuning_sigreg:.3f} emb_std {tuning_emb_std:.3f}  "
               f"lr_end {row['lr_end']:.2e}  clipped {n_clipped}/{steps_per_epoch}  {row['seconds']:.1f} s")
-    return model, log
+    gap = None
+    if target_encoder is not None:
+        gap = ema_gap(model, target_encoder, tuning_data[0], tuning_data[1])
+        print(f"ema_gap {gap:.6e} (mean squared difference of the online and target encoder outputs "
+              f"over the {len(tuning_data[1])} tuning states s_k)")
+    return model, log, gap
 
 
 def main():
@@ -301,13 +356,16 @@ def main():
     parser.add_argument("--stop_grad", action="store_true", default=None)  # None when not given
     parser.add_argument("--history", type=int)
     parser.add_argument("--predictor", choices=["mlp", "transformer"])
+    parser.add_argument("--ema_tau", type=float)
     args = parser.parse_args()
     with open(args.config, "r") as f:
         cfg = yaml.safe_load(f)
     cfg.setdefault("stop_grad", False)  # configs without the key: off (saved in config.yaml)
     cfg.setdefault("history", 1)        # configs without the key: 1 (saved in config.yaml)
     cfg.setdefault("predictor", "mlp")  # configs without the key: mlp (saved in config.yaml)
-    for key in ["seed", "embed_dim", "sigreg_weight", "lr", "epochs", "stop_grad", "history", "predictor"]:
+    cfg.setdefault("ema_tau", 0.0)      # configs without the key: off (saved in config.yaml)
+    for key in ["seed", "embed_dim", "sigreg_weight", "lr", "epochs", "stop_grad", "history", "predictor",
+                "ema_tau"]:
         if getattr(args, key) is not None:
             cfg[key] = getattr(args, key)
     check_jepa_config(cfg)
@@ -315,10 +373,11 @@ def main():
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     full = {"base": "", "full": "_full", "full_no_xy": "_fullnoxy"}[dataset_state_type(cfg["dataset"])]
     sg = "_sg" if cfg["stop_grad"] else ""
+    ema = "_ema" if cfg["ema_tau"] > 0 else ""
     tf = "_tf" if cfg["predictor"] == "transformer" else ""
     h = f"_h{cfg['history']}" if cfg["history"] > 1 else ""
     name = (f"{stamp}_jepa{full}_d{cfg['embed_dim']}_sw{cfg['sigreg_weight']:g}"
-            f"_lr{cfg['lr']:g}{sg}{tf}{h}_s{cfg['seed']}")
+            f"_lr{cfg['lr']:g}{ema}{sg}{tf}{h}_s{cfg['seed']}")
     out_dir = os.path.join(REPO_ROOT, "results", "train", name)
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite
     with open(os.path.join(out_dir, "config.yaml"), "w") as f:
@@ -333,7 +392,7 @@ def main():
     print(f"train pairs {len(train_data[1])}, tuning pairs {len(tuning_data[1])}, history {cfg['history']}, "
           f"predictor {cfg['predictor']}")
 
-    model, log = train(cfg, train_data, tuning_data, device)
+    model, log, gap = train(cfg, train_data, tuning_data, device)
 
     n_params = sum(p.numel() for p in model.parameters())
     state_dict = {k: v.cpu() for k, v in model.state_dict().items()}
@@ -357,6 +416,8 @@ def main():
         "torch_version": torch.__version__,
         "total_seconds": time.time() - t_start,
     }
+    if gap is not None:
+        meta["ema_gap"] = gap   # only with ema_tau > 0, so meta.json without EMA is unchanged
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 

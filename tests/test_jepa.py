@@ -58,6 +58,18 @@ Transformer predictor:
     or tuning pair contains NaN (the NaN row is the last state of each run, which has no action).
 (r) Loss at history 10 with the transformer on one real batch of 512: the SIGReg value is exactly the one
     of z_k and z_{k+1} encoded alone, and pred_loss matches a hand computation.
+EMA target encoder (ema_tau):
+(s) make_target_encoder() starts exactly equal to the encoder. After one train_step with tau 0.996, every
+    target parameter equals exactly 0.996 * (its value before) + 0.004 * (the online parameter after the
+    step), and differs from the online parameter.
+(t) After that step's backward, no target parameter has a gradient (and none requires one), and none is
+    in the optimizer or in the JEPA's parameters.
+(u) For the mlp predictor at history 1 and the transformer at history 3, on one real batch of 512, with a
+    target encoder that differs from the online one: pred_loss equals the mean of
+    (predict(online z_k, a, online window) - target_encoder(s_{k+1}))^2 exactly, and differs from the
+    pred_loss with the online target; SIGReg equals SIGReg of the online z_k and z_{k+1} exactly.
+(v) check_jepa_config() refuses ema_tau with stop_grad, ema_tau 1.0 and ema_tau -0.1, and accepts
+    0.0 and 0.996.
 
 Nothing is written. Run: python tests/test_jepa.py
 """
@@ -224,7 +236,7 @@ def test_determinism(data):
     print("    determinism runs:")
     weights = []
     for seed in [0, 0, 1]:
-        model, _ = train_jepa.train(dict(cfg, seed=seed), (states, rows[:640], a[:640], actions),
+        model, _, _ = train_jepa.train(dict(cfg, seed=seed), (states, rows[:640], a[:640], actions),
                                     (states, rows[:128], a[:128], actions), CPU)
         weights.append(model.state_dict())
     same = all(torch.equal(weights[0][k], weights[1][k]) for k in weights[0])
@@ -490,6 +502,82 @@ def test_transformer_loss(data):
           f"alone; pred_loss {pred_loss.item():.6f} vs hand {hand_pred.item():.6f}")
 
 
+def test_ema_update(data):
+    s, a, s_next = train_batch(data, 512)
+    torch.manual_seed(0)
+    model = JEPA(64, 1024, 3)
+    sigreg = SIGReg()
+    target = train_jepa.make_target_encoder(model.encoder)
+    assert all(torch.equal(t, e) for t, e in zip(target.parameters(), model.encoder.parameters()))
+    optimizer = torch.optim.AdamW(model.parameters(), lr=CFG["lr"], weight_decay=CFG["weight_decay"])
+    before = [t.clone() for t in target.parameters()]
+    train_jepa.train_step(model, sigreg, optimizer, s, a, s_next, CFG["sigreg_weight"], CFG["grad_clip"],
+                          target_encoder=target, ema_tau=0.996)
+    n_tensors = 0
+    for t, b, e in zip(target.parameters(), before, model.encoder.parameters()):
+        assert torch.equal(t, 0.996 * b + 0.004 * e)
+        assert not torch.equal(t, e)
+        n_tensors += 1
+    print(f"(s) target starts equal to the encoder; after one step with tau 0.996 all {n_tensors} target "
+          f"tensors == 0.996 * before + 0.004 * online after, exactly, and differ from the online ones")
+
+    # (t) the same step: no gradients on the target, and the optimizer does not see it
+    target_ids = {id(t) for t in target.parameters()}
+    assert all(t.grad is None and not t.requires_grad for t in target.parameters())
+    assert all(e.grad is not None for e in model.encoder.parameters())     # backward did run
+    optimizer_ids = {id(p) for group in optimizer.param_groups for p in group["params"]}
+    assert not target_ids & optimizer_ids
+    assert not target_ids & {id(p) for p in model.parameters()}
+    print("(t) after backward: target parameters have no .grad and requires_grad False; none of them is in "
+          "the optimizer or in the JEPA's parameters (the online encoder has gradients)")
+
+
+def test_ema_loss(data):
+    for predictor, history in [("mlp", 1), ("transformer", 3)]:
+        states, rows, a, actions = (torch.from_numpy(x) for x in train_jepa.window_pairs(data, "train", history))
+        r = rows[:512]
+        s, s_next = train_jepa.gather_windows(states, r, history), states[r + 1]
+        torch.manual_seed(0)
+        model = JEPA(64, 1024, 3, history=history, predictor=predictor)
+        sigreg = SIGReg()
+        a_in = train_jepa.predictor_actions(model, a[:512], actions, r)
+        target = train_jepa.make_target_encoder(model.encoder)
+        with torch.no_grad():                         # make the target differ from the online encoder
+            for t in target.parameters():
+                t.add_(0.01 * torch.randn_like(t))
+        torch.manual_seed(1)
+        pred_loss, sig = train_jepa.jepa_losses(model, sigreg, s, a_in, s_next, target_encoder=target)
+        with torch.no_grad():
+            z, z_next = model.encode(s[:, -1]), model.encode(s_next)
+            z_hat = model.predict(z, a_in, train_jepa.encode_past(model, s))
+            hand_pred = (z_hat - target(s_next)).square().mean()
+            online_pred = (z_hat - z_next).square().mean()
+            torch.manual_seed(1)
+            hand_sig = sigreg(torch.stack([z, z_next]))
+        assert torch.equal(pred_loss, hand_pred), (pred_loss.item(), hand_pred.item())
+        assert not torch.equal(pred_loss, online_pred)
+        assert torch.equal(sig, hand_sig), (sig.item(), hand_sig.item())
+        print(f"(u) {predictor}, history {history}: pred_loss {pred_loss.item():.6f} == hand with "
+              f"target_encoder(s_k+1) (online target would give {online_pred.item():.6f}); SIGReg "
+              f"{sig.item():.4f} == SIGReg of the online z_k, z_k+1")
+
+
+def test_ema_refusals():
+    with open(os.path.join(REPO_ROOT, "configs", "train_jepa.yaml"), "r") as f:
+        cfg = yaml.safe_load(f)
+    cfg["stop_grad"] = False
+    for bad in [dict(cfg, ema_tau=0.996, stop_grad=True), dict(cfg, ema_tau=1.0), dict(cfg, ema_tau=-0.1)]:
+        try:
+            train_jepa.check_jepa_config(bad)
+        except AssertionError as e:
+            print(f"(v) refused: {e}")
+        else:
+            raise AssertionError(f"ema_tau {bad['ema_tau']} with stop_grad {bad['stop_grad']} was not refused")
+    train_jepa.check_jepa_config(dict(cfg, ema_tau=0.0))
+    train_jepa.check_jepa_config(dict(cfg, ema_tau=0.996))
+    print("    accepted: ema_tau 0.0 and 0.996")
+
+
 def main():
     data = dict(np.load(DATASET))
     test_shapes()
@@ -510,6 +598,9 @@ def main():
     test_transformer_positions()
     test_action_windows(data)
     test_transformer_loss(data)
+    test_ema_update(data)
+    test_ema_loss(data)
+    test_ema_refusals()
     print("PASS test_jepa")
 
 

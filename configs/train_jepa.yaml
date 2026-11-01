@@ -21,6 +21,10 @@ history: 1
 # predictor network: mlp (make_mlp on [z window, a_k]) or transformer (on the windows of z and a)
 predictor: mlp
 
+# EMA target encoder: after every step target = ema_tau * target + (1 - ema_tau) * encoder, and the
+# target of pred_loss is target_encoder(s_{k+1}). 0.0 = off; 0 <= ema_tau < 1; not with stop_grad
+ema_tau: 0.0
+
 # AdamW on all parameters
 lr: 0.001
 weight_decay: 0.001
