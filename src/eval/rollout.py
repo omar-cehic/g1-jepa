@@ -9,6 +9,11 @@ contact_step True.
 
 In arrays, prediction j is at index j - 1 along the step axis.
 
+Models with a window of history n (the transformer world model, the JEPAs) use rollout_window():
+the window holds the true x_{k-n+1}, ..., x_k at the start (x = states or embeddings), and each
+prediction is appended to it while the oldest entry drops out. Prediction j gets the recorded actions
+a_{k+j-n}, ..., a_{k+j-1}. Such models give evaluate() a predict(run, starts) function instead of step.
+
 Per window group error at step j: the RMS over the group's features of the error in that window
 at step j. Divergence: a window has diverged by step j if at some step <= j any predicted feature
 except gravity_z is outside the train range (or is not finite).
@@ -66,11 +71,34 @@ def rollout(step, s0, actions):
     return preds
 
 
-def evaluate(step, data, split, H=100, bounds=None):
+def rollout_window(step, x, actions, starts, n, H):
+    """Predictions (W, H, d) of a model that sees a window of its last n inputs, for the windows starting at starts.
+
+    x (steps, d): one row per step of one run (raw states, or embeddings); actions (steps - 1, 12): the
+    run's recorded actions. starts (W,): the start rows k. step(x_window, action_window) gets
+    x_window (W, n, d) and action_window (W, n, 12), oldest first, and returns the next x (W, d).
+    The window starts as the true x_{k-n+1}, ..., x_k. Prediction j (j = 1 .. H) is
+      step([x_{k+j-n}, ..., x_{k+j-1}], [a_{k+j-n}, ..., a_{k+j-1}])
+    where an x with index above k is an earlier prediction (fed back). With n = 1 this is rollout().
+    """
+    assert starts.min() >= n - 1, f"a window of {n} would start before step 0 (first start {starts.min()})"
+    W = len(starts)
+    buf = np.empty((W, n + H, x.shape[1]), dtype=x.dtype)   # slot i holds x_{k-n+1+i}
+    buf[:, :n] = x[starts[:, None] + np.arange(1 - n, 1)]     # true x_{k-n+1}, ..., x_k
+    action_rows = starts[:, None] + np.arange(1 - n, H)       # (W, n-1+H): a_{k-n+1}, ..., a_{k+H-1}
+    for j in range(1, H + 1):
+        # slots j-1 .. j+n-2 hold x_{k+j-n} .. x_{k+j-1}; columns j-1 .. j+n-2 of action_rows the same steps
+        buf[:, n - 1 + j] = step(buf[:, j - 1:j - 1 + n], actions[action_rows[:, j - 1:j - 1 + n]])
+    return buf[:, n:]
+
+
+def evaluate(step, data, split, H=100, bounds=None, predict=None):
     """Roll out every usable window of every run in one split and return the RMS errors.
 
     data is the dict from dataset.npz (needs states, actions, valid, contact_step, split).
     bounds: (lo, hi) from train_range, or None to skip the divergence fraction.
+    predict: None to roll out step with rollout(). Otherwise a function predict(run, starts) that returns
+    the predictions (W, H, 34) in raw units for the windows of run starting at starts (step is then unused).
     Returns a dict:
       n_windows                     number of windows
       count_<subset>  (H,)          samples (windows) at each step j
@@ -98,7 +126,10 @@ def evaluate(step, data, split, H=100, bounds=None):
         truth = data["states"][run, rows + 1]               # (W, H, 34) s_{k+j}
         contact = data["contact_step"][run, rows]           # (W, H)     transition k+j-1
 
-        preds = rollout(step, s0, actions)                  # (W, H, 34)
+        if predict is None:
+            preds = rollout(step, s0, actions)              # (W, H, 34)
+        else:
+            preds = predict(run, starts)                    # (W, H, 34)
         sq_err = (preds - truth) ** 2                       # (W, H, 34)
         # np.where, not multiplying by the mask: a diverged rollout (inf) times 0 would give NaN.
         sse["contact"] += np.sum(np.where(contact[:, :, None], sq_err, 0.0), axis=0)
