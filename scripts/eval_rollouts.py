@@ -6,6 +6,9 @@ window group error, and the fraction of windows that have left the train range (
 
 Models (--model):
   constant_velocity, mlp   one step models: s_hat_{k+j+1} = step(s_hat_{k+j}, a_{k+j}) (rollout()).
+  train_mean               reference: ignores the window and predicts the same state at every step j, the mean
+                           raw state over the valid train rows (data["states"][run, k] for every valid train
+                           transition k).
   transformer              transformer world model from src/train.py, history n from model.pt. The window
                            starts as the true s_{k-n+1}, ..., s_k with the recorded a_{k-n+1}, ..., a_k.
                            Each step normalizes the state and action windows, the network gives the
@@ -22,7 +25,7 @@ Models (--model):
                            Readout floor: the same probe on the true e_{k+j}, saved with the prefix floor_.
 Networks run in eval mode, without gradients, in float32. Only recorded actions; predictions are fed back.
 
-Usage: python scripts/eval_rollouts.py --model constant_velocity [--split tuning]
+Usage: python scripts/eval_rollouts.py --model constant_velocity|train_mean [--split tuning]
        python scripts/eval_rollouts.py --model mlp|transformer|jepa --run_dir results/train/<run folder> [--split tuning]
 Output: results/rollouts/<YYYY-MM-DD_HHMMSS>_<model>_<split>/ with metrics.npz and meta.json
         (with --run_dir: <YYYY-MM-DD_HHMMSS>_<model>_<run folder name>_<split>/).
@@ -57,6 +60,24 @@ H = 100
 REPORT_STEPS = [1, 10, 50, 100]
 PROBE_SEED = 0
 PROBE_EPOCHS = 20   # fit_mlp_probe's default, as in score_jepa.py
+NO_RUN_DIR = sorted(MODELS) + ["train_mean"]   # models that need no --run_dir
+
+
+def train_mean(data):
+    """Mean raw state (34,) over the valid train rows: data["states"][run, k] for every valid train transition k."""
+    train = data["split"] == "train"
+    s_k = data["states"][train][:, :-1][data["valid"][train]]  # (n_valid, 34)
+    return s_k.mean(axis=0)
+
+
+def train_mean_predict(data, H=H):
+    """predict(run, starts) for evaluate() that ignores the window: every prediction is train_mean(data).
+    Returns predict and the mean."""
+    mean = train_mean(data)
+
+    def predict(run, starts):
+        return np.tile(mean, (len(starts), H, 1))  # (W, H, 34)
+    return predict, mean
 
 
 def check_dataset(run_dir):
@@ -220,11 +241,11 @@ def report_robust(metrics):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, choices=sorted(MODELS) + ["mlp", "transformer", "jepa"])
+    parser.add_argument("--model", required=True, choices=NO_RUN_DIR + ["mlp", "transformer", "jepa"])
     parser.add_argument("--run_dir", help="results/train/<run folder>, required with --model mlp, transformer, jepa")
     parser.add_argument("--split", default="tuning", choices=["train", "tuning"])
     args = parser.parse_args()
-    if args.model not in MODELS and args.run_dir is None:
+    if args.model not in NO_RUN_DIR and args.run_dir is None:
         parser.error(f"--run_dir is required with --model {args.model}")
 
     data = dict(np.load(os.path.join(REPO_ROOT, DATASET)))
@@ -235,6 +256,10 @@ def main():
         step = MODELS[args.model]
         name = args.model
         metrics = evaluate(step, data, args.split, H, bounds=bounds)
+    elif args.model == "train_mean":
+        name = args.model
+        predict, _ = train_mean_predict(data)
+        metrics = evaluate(None, data, args.split, H, bounds=bounds, predict=predict)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"device: {device}")
@@ -277,8 +302,11 @@ def main():
         "n_windows": int(metrics["n_windows"]),
         "state_names": STATE_NAMES,  # columns of rms_<subset>
     }
-    if args.model not in MODELS:
+    if args.model not in NO_RUN_DIR:
         meta["run_dir"] = args.run_dir
+    if args.model == "train_mean":
+        meta["prediction"] = ("train mean: the mean raw state over the valid train rows (data['states'][run, k] "
+                              "for every valid train transition k), the same at every step j")
     if args.model == "jepa":
         meta["predictor"] = predictor
         meta["probe"] = {"type": "mlp", "width": MLP_PROBE_WIDTH, "depth": MLP_PROBE_DEPTH, "epochs": PROBE_EPOCHS,

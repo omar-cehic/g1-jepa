@@ -1,5 +1,5 @@
 """Tests for the window rollouts in scripts/eval_rollouts.py and src/eval/rollout.py
-(rollout_window, evaluate(..., predict=...), the transformer world model and the JEPAs).
+(rollout_window, evaluate(..., predict=...), the transformer world model, the JEPAs and the train mean).
 
 Uses data/processed/2026-10-07_182522, the first 3 tuning runs, and the saved runs in MLP_DIR,
 TRANSFORMER_DIR and JEPA_DIRS below. Nothing is written.
@@ -13,6 +13,9 @@ TRANSFORMER_DIR and JEPA_DIRS below. Nothing is written.
     of the training code path (batch() and forward() in src/train.py) on the same pairs.
 (d) Both JEPAs, j = 1: e_hat_{k+1} from the rollout equals z_hat of embed_windows() in score_jepa.py on
     the same pairs; and the floor's embedding for prediction j equals encode(normalized s_{k+j}).
+(e) Train mean: every prediction equals the mean of data["states"][run, k] over the valid train
+    transitions k (computed here with a loop over runs), and evaluate()'s RMS error at every step j
+    (per feature and per group) equals the RMS of (truth - mean) computed directly.
 (c) and (d) print the max abs difference and fail above 1e-5 (float32 results can differ in the last
 bits with the batch size on the GPU).
 
@@ -30,8 +33,9 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "scripts"))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from eval_rollouts import (load_mlp_step, load_transformer_predict, encode_run, jepa_rollout,  # noqa: E402
-                           true_embeddings, DATASET)
+                           true_embeddings, train_mean_predict, DATASET)
 from eval.rollout import evaluate, rollout_window, train_range, usable_starts  # noqa: E402
+from features import STATE_GROUPS  # noqa: E402
 from models.mlp import normalize, denormalize  # noqa: E402
 from score_jepa import load_jepa, embed_windows  # noqa: E402
 from train import window_transitions, batch, forward  # noqa: E402
@@ -167,6 +171,41 @@ def test_jepa_first_step_and_floor(data, device, run_dir):
     assert max_diff <= TOL and max_floor_diff <= TOL, (max_diff, max_floor_diff)
 
 
+def test_train_mean(data):
+    """(e) Train mean: predictions == the mean of the valid train rows; RMS at every j == RMS of (truth - mean)."""
+    # the mean, computed independently: loop over train runs, keep s_k of every valid transition k
+    rows = [data["states"][run, np.flatnonzero(data["valid"][run])]
+            for run in np.flatnonzero(data["split"] == "train")]
+    mean = np.concatenate(rows).mean(axis=0)
+    predict, script_mean = train_mean_predict(data, H)
+    assert np.allclose(script_mean, mean, rtol=0, atol=1e-12), np.abs(script_mean - mean).max()
+
+    runs, _ = first_tuning_runs(data)
+    sub = dict(data)
+    sub["split"] = np.where(np.isin(np.arange(len(data["split"])), runs), "tuning", "unused")
+    truth = []
+    for run in runs:
+        starts = usable_starts(data["valid"][run], H)
+        preds = predict(run, starts)
+        assert preds.shape == (len(starts), H, mean.shape[0])
+        assert np.all(preds == script_mean)
+        truth.append(data["states"][run, starts[:, None] + np.arange(1, H + 1)])  # (W, H, 34) s_(k+j)
+    truth = np.concatenate(truth)
+    sq = (truth - script_mean) ** 2                                            # (all windows, H, 34)
+    rms = np.sqrt(sq.mean(axis=0))                                             # (H, 34)
+
+    m = evaluate(None, sub, "tuning", H, bounds=train_range(data), predict=predict)
+    assert m["n_windows"] == len(truth)
+    max_diff = np.abs(m["rms_all"] - rms).max()
+    for group, cols in STATE_GROUPS.items():
+        group_rms = np.sqrt(sq[:, :, cols].mean(axis=(0, 2)))                  # (H,)
+        max_diff = max(max_diff, np.abs(m[f"rms_all_{group}"] - group_rms).max())
+    print(f"(e) train mean: every prediction equals the mean of the valid train rows on {len(truth)} windows; "
+          f"evaluate() RMS vs direct RMS of (truth - mean) for j = 1..{H}, per feature and per group: "
+          f"max abs diff {max_diff:.3e} (raw units)")
+    assert max_diff <= 1e-10, max_diff
+
+
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"device: {device}")
@@ -178,6 +217,7 @@ def main():
     test_transformer_first_step(data, device)
     for run_dir in JEPA_DIRS:
         test_jepa_first_step_and_floor(data, device, run_dir)
+    test_train_mean(data)
     print("all window rollout tests passed")
 
 
