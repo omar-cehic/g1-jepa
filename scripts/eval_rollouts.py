@@ -36,8 +36,11 @@ The truth is the mean force per foot over each transition, from FORCE (scripts/b
   Readout floor: the same readout on the true x of row k+j-1, saved as floor_<stat>_<subset>_force.
   train_mean: the mean force per foot over the valid train transitions, at every j.
 
-Usage: python scripts/eval_rollouts.py --model constant_velocity|train_mean [--split tuning]
-       python scripts/eval_rollouts.py --model mlp|transformer|jepa --run_dir results/train/<run folder> [--split tuning]
+--split (train, tuning or test, default tuning) only picks the runs whose windows are evaluated. Everything that
+is fit or measured on data (train range, train mean, force readout, JEPA probe) always uses the train runs.
+
+Usage: python scripts/eval_rollouts.py --model constant_velocity|train_mean [--split tuning|test]
+       python scripts/eval_rollouts.py --model mlp|transformer|jepa --run_dir results/train/<run folder> [--split tuning|test]
 Output: results/rollouts/<YYYY-MM-DD_HHMMSS>_<model>_<split>/ with metrics.npz and meta.json
         (with --run_dir: <YYYY-MM-DD_HHMMSS>_<model>_<run folder name>_<split>/).
 """
@@ -367,7 +370,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", required=True, choices=NO_RUN_DIR + ["mlp", "transformer", "jepa"])
     parser.add_argument("--run_dir", help="results/train/<run folder>, required with --model mlp, transformer, jepa")
-    parser.add_argument("--split", default="tuning", choices=["train", "tuning"])
+    parser.add_argument("--split", default="tuning", choices=["train", "tuning", "test"])
     args = parser.parse_args()
     if args.model not in NO_RUN_DIR and args.run_dir is None:
         parser.error(f"--run_dir is required with --model {args.model}")
