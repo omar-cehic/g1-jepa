@@ -53,15 +53,16 @@ def mean_std(values):
     return np.mean(values, axis=0), np.std(values, axis=0, ddof=1)
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("label", help="name of the setting, used in the output folder name")
-    parser.add_argument("rollouts", nargs="+", help="results/rollouts/<folder>, one per seed")
-    args = parser.parse_args()
-    if len(args.rollouts) < 2:
-        parser.error("need at least 2 rollout folders for a standard deviation")
+def check_seeds(rollout_dirs):
+    """Load and check the rollout folders of one training setting, one per seed.
 
-    rollout_dirs = [full_path(r) for r in args.rollouts]
+    Checks that all folders are evaluations of training runs (meta.json has run_dir), use the same split and
+    the same model, and that their runs have the same config.yaml except the seed (keys missing from an older
+    config.yaml are filled in from ADDED_LATER) and different seeds. Stops with an error otherwise.
+    Returns rollout_metas (meta.json per folder), runs ((cfg, log, meta) per folder, cfg with the ADDED_LATER
+    keys filled in), split, model, all_keys (sorted config keys except seed) and filled (per run, the keys
+    filled in from ADDED_LATER).
+    """
     rollout_metas, runs = [], []
     for rollout_dir in rollout_dirs:
         with open(os.path.join(rollout_dir, "meta.json"), "r") as f:
@@ -93,8 +94,20 @@ def main():
     seeds = [cfg["seed"] for cfg, log, meta in runs]
     if len(set(seeds)) != len(seeds):
         sys.exit(f"error: some runs share a seed: {seeds}")
-    split = splits.pop()
-    model = models.pop()
+    return rollout_metas, runs, splits.pop(), models.pop(), all_keys, filled
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("label", help="name of the setting, used in the output folder name")
+    parser.add_argument("rollouts", nargs="+", help="results/rollouts/<folder>, one per seed")
+    args = parser.parse_args()
+    if len(args.rollouts) < 2:
+        parser.error("need at least 2 rollout folders for a standard deviation")
+
+    rollout_dirs = [full_path(r) for r in args.rollouts]
+    rollout_metas, runs, split, model, all_keys, filled = check_seeds(rollout_dirs)
+    seeds = [cfg["seed"] for cfg, log, meta in runs]
     loss_column = TUNING_LOSS_COLUMN[model]
     cfg0 = runs[0][0]
 
