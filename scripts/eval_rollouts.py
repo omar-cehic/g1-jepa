@@ -25,6 +25,17 @@ Models (--model):
                            Readout floor: the same probe on the true e_{k+j}, saved with the prefix floor_.
 Networks run in eval mode, without gradients, in float32. Only recorded actions; predictions are fed back.
 
+Foot contact force (all models except constant_velocity), the "force" group of metrics.npz, in N per foot.
+The truth is the mean force per foot over each transition, from FORCE (scripts/build_force.py).
+  Force readout (mlp, transformer, jepa): an MLP (fit_mlp_probe, seed 0, 20 epochs) from [x_k, normalized a_k]
+  to the normalized force of transition k, fit on the valid train transitions (force mean and std over the
+  same transitions). x is the normalized state s_k for mlp and transformer, the embedding encode(s_k) for jepa.
+  Prediction j: the readout on (x of row k+j-1, recorded a_{k+j-1}), where x of row k is the true x_k (j = 1)
+  and x of row k+j-1 for j >= 2 is the model's prediction j - 1. It predicts the force over transition k+j-1,
+  the transition whose contact_step label decides whether prediction j is a contact step.
+  Readout floor: the same readout on the true x of row k+j-1, saved as floor_<stat>_<subset>_force.
+  train_mean: the mean force per foot over the valid train transitions, at every j.
+
 Usage: python scripts/eval_rollouts.py --model constant_velocity|train_mean [--split tuning]
        python scripts/eval_rollouts.py --model mlp|transformer|jepa --run_dir results/train/<run folder> [--split tuning]
 Output: results/rollouts/<YYYY-MM-DD_HHMMSS>_<model>_<split>/ with metrics.npz and meta.json
@@ -46,7 +57,7 @@ REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(REPO_ROOT, "src"))
 from build_dataset import git_commit  # noqa: E402
 from eval.probe import fit_mlp_probe, apply_mlp_probe, MLP_PROBE_WIDTH, MLP_PROBE_DEPTH  # noqa: E402
-from eval.rollout import evaluate, train_range, rollout_window, SUBSETS  # noqa: E402
+from eval.rollout import evaluate, evaluate_force, train_range, rollout, rollout_window, SUBSETS  # noqa: E402
 from features import STATE_NAMES, STATE_GROUPS  # noqa: E402
 from models import constant_velocity  # noqa: E402
 from models.mlp import make_mlp, make_step, normalize, denormalize  # noqa: E402
@@ -55,6 +66,7 @@ from train import make_model  # noqa: E402
 from train_jepa import window_pairs  # noqa: E402
 
 DATASET = os.path.join("data", "processed", "2026-10-07_182522", "dataset.npz")
+FORCE = os.path.join("data", "processed", "2026-11-04_113348_foot_force", "foot_force.npz")  # built from DATASET
 MODELS = {"constant_velocity": constant_velocity.step}
 H = 100
 REPORT_STEPS = [1, 10, 50, 100]
@@ -78,6 +90,95 @@ def train_mean_predict(data, H=H):
     def predict(run, starts):
         return np.tile(mean, (len(starts), H, 1))  # (W, H, 34)
     return predict, mean
+
+
+def load_force(data):
+    """Mean force per foot per transition (runs, transitions, 2) in N from FORCE, in the order of data's runs.
+    Checks that FORCE was built from DATASET and has the same run ids."""
+    with open(os.path.join(REPO_ROOT, os.path.dirname(FORCE), "meta.json"), "r") as f:
+        source = json.load(f)["source_dataset"]
+    assert os.path.normpath(source) == os.path.normpath(DATASET), f"{FORCE} was built from {source}"
+    saved = np.load(os.path.join(REPO_ROOT, FORCE))
+    assert np.array_equal(saved["run_ids"], data["run_ids"]), "FORCE and DATASET have different run ids"
+    assert saved["foot_force"].shape == data["valid"].shape + (2,)
+    return saved["foot_force"]
+
+
+def force_train_mean(data, force):
+    """Mean and std (2,) of the force per foot over the valid train transitions."""
+    train = data["split"] == "train"
+    f = force[train][data["valid"][train]]   # (n_valid, 2)
+    return f.mean(axis=0), f.std(axis=0)
+
+
+def fit_force_readout(x_of_run, data, force, device, epochs=PROBE_EPOCHS):
+    """Fit the force readout on the valid train transitions. Returns readout(x, actions) -> force in N.
+
+    x_of_run(run) gives x (rows, dx) of every row of a run (normalized states, or embeddings). The network is
+    fit_mlp_probe (seed PROBE_SEED) from [x_k, normalized a_k] to the normalized force of transition k.
+    readout(x (..., dx), raw actions (..., 12)) returns (..., 2): the network output, denormalized.
+    """
+    mean, std = force_train_mean(data, force)
+    inputs, targets = [], []
+    for run in np.flatnonzero(data["split"] == "train"):
+        valid = data["valid"][run]
+        inputs.append(np.concatenate([x_of_run(run)[:-1][valid],
+                                      normalize(data["actions"][run][valid], data, "action")], axis=1))
+        targets.append((force[run][valid] - mean) / std)
+    net = fit_mlp_probe(np.concatenate(inputs), np.concatenate(targets), device, seed=PROBE_SEED, epochs=epochs)
+
+    def readout(x, actions):
+        lead = x.shape[:-1]
+        inp = np.concatenate([x.reshape(-1, x.shape[-1]), normalize(actions, data, "action").reshape(-1, 12)],
+                             axis=1)
+        return (apply_mlp_probe(net, inp, device) * std + mean).reshape(lead + (2,))
+    return readout
+
+
+def readout_rollout(readout, x_true, x_hat, actions, starts):
+    """Force (W, H, 2) of a rollout: prediction j from (x of row k+j-1, a_{k+j-1}).
+
+    x_true (rows, dx): true x of every row of the run; x_hat (W, H, dx): the model's predictions, index j - 1
+    holding prediction j (row k+j); actions: the run's recorded actions. The x of row k+j-1 is x_true[k]
+    for j = 1 and x_hat[:, j - 2] for j >= 2.
+    """
+    H = x_hat.shape[1]
+    x_in = np.concatenate([x_true[starts][:, None], x_hat[:, :-1]], axis=1)   # (W, H, dx)
+    return readout(x_in, actions[starts[:, None] + np.arange(H)])
+
+
+def readout_floor(readout, x_true, actions, starts, H):
+    """Force (W, H, 2) of the readout floor: prediction j from the true (x of row k+j-1, a_{k+j-1})."""
+    rows = starts[:, None] + np.arange(H)
+    return readout(x_true[rows], actions[rows])
+
+
+def add_state_force(state_predict, data, force, device, H=H, epochs=PROBE_EPOCHS):
+    """For the mlp and transformer world models: fit the force readout on normalized states and return
+    predict(run, starts) -> (raw states (W, H, 34), forces (W, H, 2)) for evaluate(..., force=...), and
+    floor_predict(run, starts) -> forces (W, H, 2) for evaluate_force(). state_predict(run, starts) gives the
+    model's raw state predictions (W, H, 34)."""
+    def x_of_run(run):
+        return normalize(data["states"][run], data, "state")
+    readout = fit_force_readout(x_of_run, data, force, device, epochs)
+
+    def predict(run, starts):
+        preds = state_predict(run, starts)
+        x_hat = normalize(preds, data, "state")
+        return preds, readout_rollout(readout, x_of_run(run), x_hat, data["actions"][run], starts)
+
+    def floor_predict(run, starts):
+        return readout_floor(readout, x_of_run(run), data["actions"][run], starts, H)
+    return predict, floor_predict
+
+
+def mlp_predict(step, data, H=H):
+    """predict(run, starts) -> raw states (W, H, 34) of a one step model: rollout() on the same arrays that
+    evaluate(step, ...) uses, so the states are the same."""
+    def predict(run, starts):
+        rows = starts[:, None] + np.arange(H)
+        return rollout(step, data["states"][run, starts], data["actions"][run, rows])
+    return predict
 
 
 def check_dataset(run_dir):
@@ -179,11 +280,14 @@ def true_embeddings(z_run, starts, H):
     return z_run[starts[:, None] + np.arange(1, H + 1)]
 
 
-def load_jepa_predicts(run_dir, data, device, H=H):
-    """For the JEPA saved by src/train_jepa.py in run_dir: predict(run, starts) of the rollout and of the
-    readout floor (both raw (W, H, 34), for evaluate()), and the model.
+def load_jepa_predicts(run_dir, data, force, device, H=H, force_epochs=PROBE_EPOCHS):
+    """For the JEPA saved by src/train_jepa.py in run_dir: predict(run, starts) of the rollout (raw states
+    (W, H, 34) and forces (W, H, 2), for evaluate(..., force=...)), floor_predict(run, starts) of the state
+    readout floor (raw (W, H, 34), for evaluate()), floor_force(run, starts) of the force readout floor
+    ((W, H, 2), for evaluate_force()), and the model.
 
-    Fits the MLP probe encode(s_k) -> normalized s_k on the valid train pairs, as score_jepa.py does.
+    Fits the MLP probe encode(s_k) -> normalized s_k on the valid train pairs, as score_jepa.py does, then
+    the force readout on [encode(s_k), normalized a_k] (fit_force_readout).
     Raises ValueError if the run was trained on another dataset than DATASET or is not a JEPA run.
     """
     cfg = check_dataset(run_dir)
@@ -201,12 +305,20 @@ def load_jepa_predicts(run_dir, data, device, H=H):
         s = apply_mlp_probe(probe, z.reshape(W * n_steps, d), device)
         return denormalize(s, data, "state").reshape(W, n_steps, s.shape[1])
 
+    readout = fit_force_readout(lambda run: encode_run(model, data, run, device), data, force, device,
+                                force_epochs)
+
     def predict(run, starts):
-        return decode(jepa_rollout(model, data, run, starts, H, device))
+        z_hat = jepa_rollout(model, data, run, starts, H, device)
+        z_true = encode_run(model, data, run, device)
+        return decode(z_hat), readout_rollout(readout, z_true, z_hat, data["actions"][run], starts)
 
     def floor_predict(run, starts):
         return decode(true_embeddings(encode_run(model, data, run, device), starts, H))
-    return predict, floor_predict, model
+
+    def floor_force(run, starts):
+        return readout_floor(readout, encode_run(model, data, run, device), data["actions"][run], starts, H)
+    return predict, floor_predict, floor_force, model
 
 
 def report(metrics):
@@ -221,6 +333,18 @@ def report(metrics):
             rms = metrics[f"rms_{subset}_{group}"]
             values = "".join(f"{rms[j - 1]:12.4e}" for j in REPORT_STEPS)
             print(f"{group if subset == 'all' else '':12s} {subset:8s}{values}")
+
+
+def report_force(metrics, title):
+    print()
+    print(f"{title}: force over transition k+j-1, N per foot (RMS over windows and both feet; median and 90th pct "
+          f"over windows of the per window error)")
+    print(f"{'':12s} {'subset':8s} {'stat':6s}" + "".join(f"{'j = ' + str(j):>12s}" for j in REPORT_STEPS))
+    for subset in SUBSETS:
+        for stat in ["rms", "median", "p90"]:
+            values = "".join(f"{metrics[f'{stat}_{subset}_force'][j - 1]:12.4e}" for j in REPORT_STEPS)
+            label = "force" if subset == "all" and stat == "rms" else ""
+            print(f"{label:12s} {subset if stat == 'rms' else '':8s} {stat:6s}{values}")
 
 
 def report_robust(metrics):
@@ -251,6 +375,7 @@ def main():
     data = dict(np.load(os.path.join(REPO_ROOT, DATASET)))
     bounds = train_range(data)
     floor = None
+    force = None if args.model in MODELS else load_force(data)
     history, predictor = 1, None
     if args.model in MODELS:
         step = MODELS[args.model]
@@ -258,31 +383,43 @@ def main():
         metrics = evaluate(step, data, args.split, H, bounds=bounds)
     elif args.model == "train_mean":
         name = args.model
-        predict, _ = train_mean_predict(data)
-        metrics = evaluate(None, data, args.split, H, bounds=bounds, predict=predict)
+        state_predict, _ = train_mean_predict(data)
+        force_mean, _ = force_train_mean(data, force)
+
+        def predict(run, starts):
+            return state_predict(run, starts), np.tile(force_mean, (len(starts), H, 1))
+        metrics = evaluate(None, data, args.split, H, bounds=bounds, predict=predict, force=force)
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"device: {device}")
         run_dir = os.path.join(REPO_ROOT, args.run_dir)
         name = f"{args.model}_{os.path.basename(os.path.normpath(args.run_dir))}"
-        if args.model == "mlp":
-            metrics = evaluate(load_mlp_step(run_dir, data, device), data, args.split, H, bounds=bounds)
-        elif args.model == "transformer":
-            predict, model = load_transformer_predict(run_dir, data, device)
-            history = model.history
-            metrics = evaluate(None, data, args.split, H, bounds=bounds, predict=predict)
+        if args.model in ["mlp", "transformer"]:
+            if args.model == "mlp":
+                state_predict = mlp_predict(load_mlp_step(run_dir, data, device), data)
+            else:
+                state_predict, model = load_transformer_predict(run_dir, data, device)
+                history = model.history
+            predict, floor_force = add_state_force(state_predict, data, force, device)
+            metrics = evaluate(None, data, args.split, H, bounds=bounds, predict=predict, force=force)
+            floor = evaluate_force(floor_force, data, force, args.split, H)
         else:
-            predict, floor_predict, model = load_jepa_predicts(run_dir, data, device)
+            predict, floor_predict, floor_force, model = load_jepa_predicts(run_dir, data, force, device)
             history, predictor = model.history, model.predictor_type
-            metrics = evaluate(None, data, args.split, H, bounds=bounds, predict=predict)
+            metrics = evaluate(None, data, args.split, H, bounds=bounds, predict=predict, force=force)
             floor = evaluate(None, data, args.split, H, bounds=bounds, predict=floor_predict)
+            floor.update(evaluate_force(floor_force, data, force, args.split, H))
     print(f"model {args.model}, split {args.split}, H = {H}, RMS error in raw units")
     report(metrics)
     report_robust(metrics)
+    if force is not None:
+        report_force(metrics, "foot force")
     if floor is not None:
-        print("\nreadout floor: the same probe on the true embeddings encode(s_{k+j}), same windows")
-        report(floor)
-        report_robust(floor)
+        if args.model == "jepa":
+            print("\nreadout floor: the same probe on the true embeddings encode(s_{k+j}), same windows")
+            report(floor)
+            report_robust(floor)
+        report_force(floor, "foot force readout floor (the same readout on the true x of row k+j-1)")
         metrics = {**metrics, **{"floor_" + key: value for key, value in floor.items()}}
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
@@ -312,6 +449,19 @@ def main():
         meta["probe"] = {"type": "mlp", "width": MLP_PROBE_WIDTH, "depth": MLP_PROBE_DEPTH, "epochs": PROBE_EPOCHS,
                          "seed": PROBE_SEED, "fit_on": "valid train pairs: encode(s_k) -> normalized s_k",
                          "decode": "probe output denormalized with the state stats"}
+    if force is not None:
+        mean, std = force_train_mean(data, force)
+        meta["force"] = {"file": FORCE, "units": "N", "feet": ["left", "right"],
+                         "train_mean": mean.tolist(), "train_std": std.tolist(),
+                         "target": "force over transition k+j-1 for prediction j"}
+        if args.model != "train_mean":
+            meta["force"]["readout"] = {
+                "type": "mlp", "width": MLP_PROBE_WIDTH, "depth": MLP_PROBE_DEPTH, "epochs": PROBE_EPOCHS,
+                "seed": PROBE_SEED,
+                "x": "embedding encode(s_k)" if args.model == "jepa" else "normalized state s_k",
+                "fit_on": "valid train transitions: [x_k, normalized a_k] -> (force_k - train_mean) / train_std",
+                "rollout_input": "x of row k+j-1 (true for j = 1, prediction j - 1 after), recorded a_{k+j-1}",
+                "floor_input": "true x of row k+j-1, recorded a_{k+j-1}"}
     with open(os.path.join(out_dir, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
 

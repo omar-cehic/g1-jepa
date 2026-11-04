@@ -1,19 +1,22 @@
 """Plot rollout error against time for several models, from their rollout folders (scripts/eval_rollouts.py).
 
-One figure per subset (all, contact, rest). Each has one panel per state group and one diverged fraction panel.
+One figure per subset (all, contact, rest), 3 x 3 panels: one per state group, one for the foot contact force,
+one diverged fraction panel and the legend.
   Group panels (log y): the median over windows of the per window group error (metrics.npz
     median_<subset>_<group>, raw units) against the time after the start state, t = j * dt for j = 1..H.
     One line per label: the mean over its seeds, with a band from the lowest to the highest seed.
-    Labels whose folders have floor_ keys (jepa) also get the readout floor (mean over seeds of
-    floor_median_<subset>_<group>), dashed, same color, no band.
+    Labels whose folders have floor_median_<subset>_<group> also get that readout floor (mean over seeds),
+    dashed, same color, no band (state groups: jepa; force: mlp, transformer and jepa).
     A train_mean label is one gray dashed line, no band.
+  Force panel (log y): the same for the force group (N per foot), for the labels whose folders have it
+    (folders made before the force group was added do not).
   Diverged panel (linear y): diverged_frac, mean over seeds and min to max band. metrics.npz has it for all
     windows only, so this panel is the same in the three figures. No readout floor here.
 
 Checks (stops with an error otherwise):
   all folders use the same split and dataset, and the same H;
   per label, aggregate_seeds.check_seeds (training runs, same model, same config.yaml except the seed,
-  different seeds) and at least 2 folders; all or none of a label's folders have floor_ keys;
+  different seeds) and at least 2 folders; all of a label's metrics.npz files have the same keys;
   a train_mean label (meta.json model train_mean) has exactly 1 folder.
 dt is not stored in the dataset: it is read from the raw data the dataset was built from (the dataset's
 meta.json source_raw_dir, column t of every raw run file). Stops if the t spacing is not the same in every
@@ -50,7 +53,7 @@ from summarize_runs import full_path  # noqa: E402
 COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
 TRAIN_MEAN_COLOR = "0.45"  # gray
 UNITS = {"height": "m", "gravity": "unit vector", "lin_vel": "m/s", "ang_vel": "rad/s",
-         "joint_pos": "rad", "joint_vel": "rad/s"}
+         "joint_pos": "rad", "joint_vel": "rad/s", "force": "N per foot"}
 
 
 def time_step(dataset):
@@ -97,16 +100,18 @@ def load_label(label, folders):
         seeds = [cfg["seed"] for cfg, log, meta in runs]
         run_dirs = [m["run_dir"] for m in metas]
     metrics = [np.load(os.path.join(r, "metrics.npz")) for r in rollout_dirs]
-    has_floor = {any(key.startswith("floor_") for key in m.files) for m in metrics}
-    if len(has_floor) != 1:
-        sys.exit(f"error: label {label}: some metrics.npz files have floor_ keys and some do not")
+    if len({frozenset(m.files) for m in metrics}) != 1:
+        sys.exit(f"error: label {label}: the metrics.npz files do not all have the same keys")
+    keys = set(metrics[0].files)
+    floor_groups = [g for g in list(STATE_GROUPS) + ["force"] if f"floor_median_all_{g}" in keys]
     return {"model": model, "metas": metas, "seeds": seeds, "run_dirs": run_dirs, "metrics": metrics,
-            "rollout_dirs": [os.path.relpath(r, REPO_ROOT) for r in rollout_dirs], "has_floor": has_floor.pop()}
+            "rollout_dirs": [os.path.relpath(r, REPO_ROOT) for r in rollout_dirs], "keys": keys,
+            "has_force": "median_all_force" in keys, "floor_groups": floor_groups}
 
 
 def plot_label(ax, t, name, entry, color, key, floor):
     """One label in one panel: metrics key against t, mean over seeds with a min to max band (train_mean: one
-    gray dashed line). With floor, also the mean of floor_<key>, dashed."""
+    gray dashed line). With floor, also the mean of floor_<key> if the label has it, dashed."""
     values = np.stack([m[key] for m in entry["metrics"]])  # (seeds, H)
     if entry["model"] == "train_mean":
         ax.plot(t, values[0], color=TRAIN_MEAN_COLOR, linestyle="--", linewidth=1.5, label=name)
@@ -114,7 +119,7 @@ def plot_label(ax, t, name, entry, color, key, floor):
     n = len(values)
     ax.fill_between(t, values.min(axis=0), values.max(axis=0), color=color, alpha=0.2, linewidth=0)
     ax.plot(t, values.mean(axis=0), color=color, linewidth=1.5, label=f"{name} (n = {n})")
-    if floor and entry["has_floor"]:
+    if floor and "floor_" + key in entry["keys"]:
         floor_mean = np.stack([m["floor_" + key] for m in entry["metrics"]]).mean(axis=0)
         ax.plot(t, floor_mean, color=color, linestyle="--", linewidth=1.2, label=f"{name} readout floor")
 
@@ -162,26 +167,32 @@ def main():
     os.makedirs(out_dir)  # raises if the folder already exists: never overwrite
 
     for subset in SUBSETS:
-        fig, axes = plt.subplots(2, 4, figsize=(17, 8), sharex=True)
+        fig, axes = plt.subplots(3, 3, figsize=(15, 12), sharex=True)
         axes = axes.flat
-        for ax, group in zip(axes, STATE_GROUPS):
+        for ax, group in zip(axes, list(STATE_GROUPS) + ["force"]):
             for name, entry in labels.items():
-                plot_label(ax, t, name, entry, colors[name], f"median_{subset}_{group}", floor=True)
+                if group != "force" or entry["has_force"]:
+                    plot_label(ax, t, name, entry, colors[name], f"median_{subset}_{group}", floor=True)
             ax.set_yscale("log")
-            ax.set_title(group)
+            ax.set_title("foot contact force" if group == "force" else group)
             ax.set_ylabel(f"median error [{UNITS[group]}]")
-        ax = axes[len(STATE_GROUPS)]
+        n_groups = len(STATE_GROUPS) + 1
+        ax = axes[n_groups]
         for name, entry in labels.items():
             plot_label(ax, t, name, entry, colors[name], "diverged_frac", floor=False)
         ax.set_title("diverged fraction (all windows)")
         ax.set_ylabel("fraction of windows")
-        for ax in axes[: len(STATE_GROUPS) + 1]:
+        for ax in axes[: n_groups + 1]:
             ax.grid(True, which="major", alpha=0.3)
-        for ax in axes[4:]:
+        for ax in axes[6:]:
             ax.set_xlabel("time after start state [s]")
-        legend_ax = axes[len(STATE_GROUPS) + 1]
+        legend_ax = axes[n_groups + 1]
         legend_ax.axis("off")
-        legend_ax.legend(*axes[0].get_legend_handles_labels(), loc="center", fontsize=9, frameon=False)
+        handles = {}  # label text -> line, from every panel (the mlp and transformer floors are only in force)
+        for ax in axes[:n_groups]:
+            for handle, text in zip(*ax.get_legend_handles_labels()):
+                handles.setdefault(text, handle)
+        legend_ax.legend(handles.values(), handles.keys(), loc="center", fontsize=9, frameon=False)
         fig.suptitle(f"Rollout error, subset {subset}, {split} split. Median over windows of the per window group "
                      f"error; line = mean over seeds, band = min to max over seeds, dashed = readout floor")
         fig.tight_layout()
@@ -195,7 +206,8 @@ def main():
              ""]
     for name, entry in labels.items():
         lines.append(f"label {name}: model {entry['model']}, n folders {len(entry['metrics'])}, "
-                     f"readout floor {entry['has_floor']}, color {colors[name]}")
+                     f"force {entry['has_force']}, readout floor groups {entry['floor_groups']}, "
+                     f"color {colors[name]}")
         for seed, rollout_dir, run_dir in zip(entry["seeds"], entry["rollout_dirs"], entry["run_dirs"]):
             lines.append(f"  seed {seed}  {rollout_dir}  (run {run_dir})")
         lines.append("")

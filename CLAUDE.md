@@ -56,6 +56,8 @@ I am a CS junior and I need to understand every line of this code, because I wil
 - Build the full state dataset without pelvis x and y (qpos[2:] and qvel, 35 numbers): `python scripts/build_dataset.py configs/build_dataset_full_no_xy.yaml` (writes data/processed/<timestamp>/; current one is data/processed/2026-10-29_162623)
 - Full state dataset test (full or full_no_xy): `python tests/test_full_state_dataset.py data/processed/<full state folder>`
 - Train on the full_no_xy dataset: `python src/train_jepa.py configs/train_jepa_full_no_xy.yaml` and `python src/train.py configs/train_mlp_full_no_xy.yaml` (run folders get "_fullnoxy")
+- Build the foot force file (mean force per foot per transition, plus the m g physics check): `python scripts/build_force.py data/processed/<dataset folder>` (writes data/processed/<timestamp>_foot_force/; current one for the official dataset is data/processed/2026-11-04_113348_foot_force)
+- Force tests (force file, readout indexing, force metrics, j = 1 rollout == floor, state keys unchanged; about 1.5 min with GPU): `python tests/test_force.py`
 - Contact exploration plots: `python scripts/explore_contact.py data/raw/<folder>` (writes results/<timestamp>_explore_contact/)
 - Logger tests (plain scripts, no pytest): `for t in tests/test_*.py; do python $t || break; done`
 - SIGReg test (synthetic data, about 2.5 min on CPU): `python tests/test_sigreg.py`

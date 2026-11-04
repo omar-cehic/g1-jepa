@@ -10,9 +10,12 @@ Prints, over seeds: the mean, the sample standard deviation (ddof = 1) and the n
   the final tuning loss (last row of log.csv: column tuning_loss for mlp and transformer,
   tuning_pred_loss for jepa),
   for each state group and subset (all, contact, rest): the RMS, median and p90 at j = 1, 10, 50, 100,
+  the same for the force group (foot contact force, N per foot) if the metrics.npz files have it,
   the diverged fraction at j = 1, 10, 50, 100.
-If the metrics.npz files have floor_ keys (jepa: the probe on the true embeddings), prints the same
-table for them, titled "readout floor".
+If the metrics.npz files have floor_ keys, prints the same table for them, titled "readout floor", with the
+groups they have (jepa: the state groups, from the probe on the true embeddings, and the force group;
+mlp and transformer: the force group only, from the force readout on the true states). The diverged
+fraction row is printed only where the files have it. All folders must have the same groups.
 
 Folder paths are relative to the root of this repo (or absolute).
 
@@ -46,11 +49,27 @@ TUNING_LOSS_COLUMN = {"mlp": "tuning_loss", "transformer": "tuning_loss", "jepa"
 #   tuning_loss_column (the log.csv column, not per seed), tuning_loss_final (n,),
 #   <stat>_<subset>_<group> (n, 4), diverged_frac (n, 4),
 #   and if the metrics.npz files have them: floor_<stat>_<subset>_<group> (n, 4), floor_diverged_frac (n, 4)
+#   (<group> is a state group or force)
+GROUPS = list(STATE_GROUPS) + ["force"]
 
 
 def mean_std(values):
     """Mean and sample std (ddof = 1) over axis 0."""
     return np.mean(values, axis=0), np.std(values, axis=0, ddof=1)
+
+
+def metric_groups(metrics):
+    """{prefix: groups} for prefix "" and "floor_": the groups (of GROUPS) that have <prefix>rms_all_<group>
+    in every metrics.npz. Stops with an error if some files have a group and some do not."""
+    groups = {}
+    for prefix in ["", "floor_"]:
+        for group in GROUPS:
+            has = {f"{prefix}rms_all_{group}" in m.files for m in metrics}
+            if len(has) != 1:
+                sys.exit(f"error: some metrics.npz files have {prefix}rms_all_{group} and some do not")
+            if has.pop():
+                groups.setdefault(prefix, []).append(group)
+    return groups
 
 
 def check_seeds(rollout_dirs):
@@ -140,18 +159,16 @@ def main():
         "tuning_loss_final": np.array([log[loss_column][-1] for cfg, log, meta in runs]),
     }
     metrics = [np.load(os.path.join(r, "metrics.npz")) for r in rollout_dirs]
-    has_floor = {any(key.startswith("floor_") for key in m.files) for m in metrics}
-    if len(has_floor) != 1:
-        sys.exit("error: some metrics.npz files have floor_ keys and some do not")
-    prefixes = ["", "floor_"] if has_floor.pop() else [""]
+    groups = metric_groups(metrics)
     idx = np.array(REPORT_STEPS) - 1  # prediction j is at index j - 1
-    for prefix in prefixes:
+    for prefix in groups:
         for stat in STATS:
             for subset in SUBSETS:
-                for group in STATE_GROUPS:
+                for group in groups[prefix]:
                     key = f"{prefix}{stat}_{subset}_{group}"
                     per_seed[key] = np.stack([m[key][idx] for m in metrics])
-        per_seed[prefix + "diverged_frac"] = np.stack([m[prefix + "diverged_frac"][idx] for m in metrics])
+        if prefix + "diverged_frac" in metrics[0].files:
+            per_seed[prefix + "diverged_frac"] = np.stack([m[prefix + "diverged_frac"][idx] for m in metrics])
 
     n = len(seeds)
     out()
@@ -161,22 +178,30 @@ def main():
     def out_table(prefix):
         """The mean ± std table of the per_seed keys that start with prefix."""
         out(f"{'group':10s} {'subset':8s} {'stat':6s}" + "".join(f"{'j = ' + str(j):>24s}" for j in REPORT_STEPS))
-        for group in STATE_GROUPS:
+        for group in groups[prefix]:
             for subset in SUBSETS:
                 for stat in STATS:
                     mean, std = mean_std(per_seed[f"{prefix}{stat}_{subset}_{group}"])
                     cells = "".join(f"{m:12.4e} ± {s:9.2e}" for m, s in zip(mean, std))
                     out(f"{group:10s} {subset:8s} {stat:6s}{cells}")
             out()
+        if prefix + "diverged_frac" not in per_seed:
+            return
         mean, std = mean_std(per_seed[prefix + "diverged_frac"])
         out(f"{'diverged':10s} {'all':8s} {'frac':6s}" + "".join(f"{m:12.4f} ± {s:9.4f}" for m, s in zip(mean, std)))
 
     out()
-    out(f"rollout errors in raw units, mean ± std over n = {n} seeds, j = steps after the start state")
+    force_units = " (force: N per foot)" if "force" in groups[""] else ""
+    out(f"rollout errors in raw units{force_units}, mean ± std over n = {n} seeds, j = steps after the start state")
     out_table("")
-    if "floor_" in prefixes:
+    if "floor_" in groups:
+        what = []
+        if groups["floor_"][0] != "force":
+            what.append("state groups: the probe on the true embeddings")
+        if "force" in groups["floor_"]:
+            what.append("force: the force readout on the true x of row k+j-1")
         out()
-        out(f"readout floor: the probe on the true embeddings, raw units, mean ± std over n = {n} seeds")
+        out(f"readout floor ({'; '.join(what)}), raw units, mean ± std over n = {n} seeds")
         out_table("floor_")
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")

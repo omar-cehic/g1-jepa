@@ -15,7 +15,12 @@ prediction is appended to it while the oldest entry drops out. Prediction j gets
 a_{k+j-n}, ..., a_{k+j-1}. Such models give evaluate() a predict(run, starts) function instead of step.
 
 Per window group error at step j: the RMS over the group's features of the error in that window
-at step j. Divergence: a window has diverged by step j if at some step <= j any predicted feature
+at step j.
+
+Foot contact force (optional): prediction j also gives the mean force per foot over transition k+j-1
+(the same transition whose contact_step label decides whether prediction j is a contact step),
+compared with the recorded force of that transition. It is one more group, "force" (2 features,
+left and right foot, in N). Divergence: a window has diverged by step j if at some step <= j any predicted feature
 except gravity_z is outside the train range (or is not finite).
 """
 
@@ -92,13 +97,58 @@ def rollout_window(step, x, actions, starts, n, H):
     return buf[:, n:]
 
 
-def evaluate(step, data, split, H=100, bounds=None, predict=None):
+def force_stats(pred, truth, contact):
+    """Force group metrics from predicted and true forces (N, H, 2) in N and contact labels (N, H), N windows.
+
+    Per window error at step j: sqrt of the mean over the two feet of the squared error (N per foot).
+    Returns rms_<subset>_force (H,) (sqrt of the mean over windows in the subset and both feet of the squared
+    error), median_<subset>_force and p90_<subset>_force (H,) (over the windows in the subset of the per window
+    error), for subset in all, contact, rest. A step with no samples gets NaN.
+    """
+    sq_err = (pred - truth) ** 2                     # (N, H, 2)
+    window_err = np.sqrt(sq_err.mean(axis=2))        # (N, H)
+    in_subset = {"all": np.ones_like(contact), "contact": contact, "rest": ~contact}
+    out = {}
+    for subset in SUBSETS:
+        mask = in_subset[subset]
+        n = mask.sum(axis=0)                          # windows in the subset at each j
+        with np.errstate(invalid="ignore", divide="ignore"):
+            out[f"rms_{subset}_force"] = np.sqrt(np.where(mask[:, :, None], sq_err, 0.0).sum(axis=(0, 2)) / (2 * n))
+        median, p90 = np.full(len(n), np.nan), np.full(len(n), np.nan)
+        for j in range(len(n)):
+            e = window_err[mask[:, j], j]
+            if len(e) > 0:
+                median[j], p90[j] = np.median(e), np.percentile(e, 90)
+        out[f"median_{subset}_force"], out[f"p90_{subset}_force"] = median, p90
+    return out
+
+
+def evaluate_force(force_predict, data, force, split, H=100):
+    """Force group metrics (force_stats) of force_predict(run, starts) -> (W, H, 2) in N, on the same windows
+    as evaluate(). Prediction j is compared with force[run, k+j-1], the force over transition k+j-1, and is a
+    contact step if that transition is. Used for the readout floor."""
+    preds, truths, contacts = [], [], []
+    for run in np.flatnonzero(data["split"] == split):
+        starts = usable_starts(data["valid"][run], H)
+        if len(starts) == 0:
+            continue
+        rows = starts[:, None] + np.arange(H)               # (W, H): row k+j-1 for prediction j
+        preds.append(force_predict(run, starts))
+        truths.append(force[run, rows])
+        contacts.append(data["contact_step"][run, rows])
+    return force_stats(np.concatenate(preds), np.concatenate(truths), np.concatenate(contacts))
+
+
+def evaluate(step, data, split, H=100, bounds=None, predict=None, force=None):
     """Roll out every usable window of every run in one split and return the RMS errors.
 
     data is the dict from dataset.npz (needs states, actions, valid, contact_step, split).
     bounds: (lo, hi) from train_range, or None to skip the divergence fraction.
     predict: None to roll out step with rollout(). Otherwise a function predict(run, starts) that returns
     the predictions (W, H, 34) in raw units for the windows of run starting at starts (step is then unused).
+    force: None, or the true mean force per transition (runs, transitions, 2) in N. Then predict must return
+    (states (W, H, 34), forces (W, H, 2)), where forces[:, j - 1] predicts force[run, k+j-1], and the force
+    group metrics of force_stats() are added.
     Returns a dict:
       n_windows                     number of windows
       count_<subset>  (H,)          samples (windows) at each step j
@@ -107,6 +157,7 @@ def evaluate(step, data, split, H=100, bounds=None, predict=None):
       median_<subset>_<group> (H,)  median over windows of the per window group error at step j
       p90_<subset>_<group> (H,)     90th percentile of the same
       diverged_frac (H,)            fraction of all windows that have diverged by step j (only with bounds)
+      rms_/median_/p90_<subset>_force (H,)  force group, N per foot (only with force; see force_stats)
     for subset in all, contact, rest. A step with no samples gets NaN.
     """
     n_features = data["states"].shape[2]
@@ -115,6 +166,7 @@ def evaluate(step, data, split, H=100, bounds=None, predict=None):
     n_windows = 0
     # Kept for every window (one list entry per run): what the medians and the divergence need.
     group_err, contact_all, first = [], [], []
+    force_pred, force_true = [], []   # only with force
 
     for run in np.flatnonzero(data["split"] == split):
         starts = usable_starts(data["valid"][run], H)
@@ -128,8 +180,12 @@ def evaluate(step, data, split, H=100, bounds=None, predict=None):
 
         if predict is None:
             preds = rollout(step, s0, actions)              # (W, H, 34)
-        else:
+        elif force is None:
             preds = predict(run, starts)                    # (W, H, 34)
+        else:
+            preds, f = predict(run, starts)                 # (W, H, 34), (W, H, 2)
+            force_pred.append(f)
+            force_true.append(force[run, rows])             # (W, H, 2) force over transition k+j-1
         sq_err = (preds - truth) ** 2                       # (W, H, 34)
         # np.where, not multiplying by the mask: a diverged rollout (inf) times 0 would give NaN.
         sse["contact"] += np.sum(np.where(contact[:, :, None], sq_err, 0.0), axis=0)
@@ -173,4 +229,6 @@ def evaluate(step, data, split, H=100, bounds=None, predict=None):
     if bounds is not None:
         first = np.concatenate(first)
         out["diverged_frac"] = np.array([np.mean(first <= j) for j in range(1, H + 1)])
+    if force is not None:
+        out.update(force_stats(np.concatenate(force_pred), np.concatenate(force_true), contact_all))
     return out
