@@ -6,10 +6,16 @@ one diverged fraction panel and the legend.
     median_<subset>_<group>, raw units) against the time after the start state, t = j * dt for j = 1..H.
     One line per label: the mean over its seeds, with a band from the lowest to the highest seed.
     Labels whose folders have floor_median_<subset>_<group> also get that readout floor (mean over seeds),
-    dashed, same color, no band (state groups: jepa; force: mlp, transformer and jepa).
+    dashed, same color, no band (state groups: jepa; force: jepa only, see the direct models force floor below).
     A train_mean label is one gray dashed line, no band.
   Force panel (log y): the same for the force group (N per foot), for the labels whose folders have it
     (folders made before the force group was added do not).
+    Direct models force floor: the force readout floor of the direct models (mlp and transformer, by the model in
+    meta.json) is fit on true states and applied to true states, so it does not depend on the world model. It is
+    drawn once, black dashed, labeled "direct models force floor", after checking that every floor_*_force key is
+    exactly equal in every direct model folder.
+Colors: one fixed color per label (LABEL_COLORS), so a label has the same color in every plot; other labels are
+refused.
   Diverged panel (linear y): diverged_frac, mean over seeds and min to max band. metrics.npz has it for all
     windows only, so this panel is the same in the three figures. No readout floor here.
 
@@ -49,9 +55,19 @@ from features import STATE_GROUPS  # noqa: E402
 from aggregate_seeds import check_seeds  # noqa: E402
 from summarize_runs import full_path  # noqa: E402
 
-# Slots 1 to 4 of the categorical palette of the dataviz skill's reference palette: blue, orange, aqua, yellow.
-COLORS = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100"]
-TRAIN_MEAN_COLOR = "0.45"  # gray
+# One fixed color per label. Slots 1 to 6 of the dataviz skill's reference categorical palette (light mode), in
+# slot order: blue, orange, aqua, yellow, magenta, green. train_mean is gray.
+LABEL_COLORS = {
+    "mlp": "#2a78d6",
+    "transformer_world_model": "#eb6834",
+    "jepa_baseline": "#1baf7a",
+    "jepa_transformer": "#eda100",
+    "mlp_lr0.003": "#e87ba4",
+    "jepa_baseline_lr0.0003": "#008300",
+    "train_mean": "0.45",
+}
+DIRECT_MODELS = ["mlp", "transformer"]  # models whose force readout floor is drawn once, in black
+DIRECT_FLOOR_COLOR = "black"
 UNITS = {"height": "m", "gravity": "unit vector", "lin_vel": "m/s", "ang_vel": "rad/s",
          "joint_pos": "rad", "joint_vel": "rad/s", "force": "N per foot"}
 
@@ -109,16 +125,39 @@ def load_label(label, folders):
             "has_force": "median_all_force" in keys, "floor_groups": floor_groups}
 
 
+def direct_force_floor(labels):
+    """The force readout floor of the direct models: the metrics.npz of one direct model folder (mlp or
+    transformer) that has floor_median_all_force, or None if there is none, and the number of folders checked.
+
+    Stops with an error unless every floor_*_force key is exactly equal in every direct model folder that has
+    it (the floor is the force readout on true states, so the world model does not enter it)."""
+    folders = [(rollout_dir, m) for e in labels.values() if e["model"] in DIRECT_MODELS
+               for rollout_dir, m in zip(e["rollout_dirs"], e["metrics"]) if "floor_median_all_force" in m.files]
+    if not folders:
+        return None, 0
+    first_dir, first = folders[0]
+    keys = [k for k in first.files if k.startswith("floor_") and k.endswith("_force")]
+    for rollout_dir, m in folders[1:]:
+        for key in keys:
+            if not np.array_equal(m[key], first[key], equal_nan=True):
+                sys.exit(f"error: {key} differs between {first_dir} and {rollout_dir}, so the direct models "
+                         f"force floor cannot be drawn once")
+    return first, len(folders)
+
+
 def plot_label(ax, t, name, entry, color, key, floor):
     """One label in one panel: metrics key against t, mean over seeds with a min to max band (train_mean: one
-    gray dashed line). With floor, also the mean of floor_<key> if the label has it, dashed."""
+    dashed line). With floor, also the mean of floor_<key> if the label has it, dashed, except the force floor
+    of the direct models (drawn once in main())."""
     values = np.stack([m[key] for m in entry["metrics"]])  # (seeds, H)
     if entry["model"] == "train_mean":
-        ax.plot(t, values[0], color=TRAIN_MEAN_COLOR, linestyle="--", linewidth=1.5, label=name)
+        ax.plot(t, values[0], color=color, linestyle="--", linewidth=1.5, label=name)
         return
     n = len(values)
     ax.fill_between(t, values.min(axis=0), values.max(axis=0), color=color, alpha=0.2, linewidth=0)
     ax.plot(t, values.mean(axis=0), color=color, linewidth=1.5, label=f"{name} (n = {n})")
+    if entry["model"] in DIRECT_MODELS and key.endswith("_force"):
+        return
     if floor and "floor_" + key in entry["keys"]:
         floor_mean = np.stack([m["floor_" + key] for m in entry["metrics"]]).mean(axis=0)
         ax.plot(t, floor_mean, color=color, linestyle="--", linewidth=1.2, label=f"{name} readout floor")
@@ -134,10 +173,11 @@ def main():
         parser.error(f"a label is given twice: {names}")
     if any(len(entry) < 2 for entry in args.label):
         parser.error("each --label needs a label and at least one folder")
+    unknown = [name for name in names if name not in LABEL_COLORS]
+    if unknown:
+        parser.error(f"labels without a fixed color: {unknown}; known labels: {list(LABEL_COLORS)}")
 
     labels = {entry[0]: load_label(entry[0], entry[1:]) for entry in args.label}
-    if sum(e["model"] != "train_mean" for e in labels.values()) > len(COLORS):
-        sys.exit(f"error: at most {len(COLORS)} labels besides train_mean (one color each)")
     all_metas = [m for e in labels.values() for m in e["metas"]]
     splits = {m["split"] for m in all_metas}
     if len(splits) != 1:
@@ -154,13 +194,8 @@ def main():
     print(f"split {split}, dataset {dataset}, H = {H}, dt = {dt:.6g} s (raw t column of {n_runs_checked} runs "
           f"in {os.path.relpath(raw_dir, REPO_ROOT)}; each dataset run has as many rows as its raw run)")
 
-    colors, i = {}, 0
-    for name, entry in labels.items():
-        if entry["model"] != "train_mean":
-            colors[name] = COLORS[i]
-            i += 1
-        else:
-            colors[name] = TRAIN_MEAN_COLOR
+    colors = {name: LABEL_COLORS[name] for name in labels}
+    direct_floor, n_direct_floor = direct_force_floor(labels)
 
     stamp = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
     out_dir = os.path.join(REPO_ROOT, "results", "figures", f"{stamp}_rollouts")
@@ -173,6 +208,9 @@ def main():
             for name, entry in labels.items():
                 if group != "force" or entry["has_force"]:
                     plot_label(ax, t, name, entry, colors[name], f"median_{subset}_{group}", floor=True)
+            if group == "force" and direct_floor is not None:
+                ax.plot(t, direct_floor[f"floor_median_{subset}_force"], color=DIRECT_FLOOR_COLOR, linestyle="--",
+                        linewidth=1.2, label="direct models force floor")
             ax.set_yscale("log")
             ax.set_title("foot contact force" if group == "force" else group)
             ax.set_ylabel(f"median error [{UNITS[group]}]")
@@ -188,7 +226,7 @@ def main():
             ax.set_xlabel("time after start state [s]")
         legend_ax = axes[n_groups + 1]
         legend_ax.axis("off")
-        handles = {}  # label text -> line, from every panel (the mlp and transformer floors are only in force)
+        handles = {}  # label text -> line, from every panel (the direct models force floor is only in force)
         for ax in axes[:n_groups]:
             for handle, text in zip(*ax.get_legend_handles_labels()):
                 handles.setdefault(text, handle)
@@ -203,6 +241,8 @@ def main():
     lines = [f"command: python scripts/plot_rollouts.py " + " ".join(sys.argv[1:]),
              f"split {split}, dataset {dataset}, H {H}",
              f"dt {dt!r} s, from the t column of {n_runs_checked} raw runs in {os.path.relpath(raw_dir, REPO_ROOT)}",
+             f"direct models force floor: drawn once, {DIRECT_FLOOR_COLOR} dashed; floor_*_force exactly equal in "
+             f"all {n_direct_floor} direct model folders",
              ""]
     for name, entry in labels.items():
         lines.append(f"label {name}: model {entry['model']}, n folders {len(entry['metrics'])}, "
